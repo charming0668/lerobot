@@ -13,13 +13,18 @@
 # limitations under the License.
 
 """
-Setup and debug CAN interfaces for Damiao motors (e.g., OpenArms).
+Setup SocketCAN interfaces and debug Damiao motors (e.g., OpenArms) / PiPER arms.
 
 Examples:
 
 Setup CAN interfaces with CAN FD:
 ```shell
 lerobot-setup-can --mode=setup --interfaces=can0,can1,can2,can3
+```
+
+Setup PiPER interfaces by USB-CAN serial number:
+```shell
+lerobot-setup-can --mode=setup --usb_can_serials=<SERIAL_1>,<SERIAL_2>
 ```
 
 Test motors on a single interface:
@@ -46,6 +51,7 @@ from dataclasses import dataclass, field
 import draccus
 
 from lerobot.utils.import_utils import _can_available
+from lerobot.utils.piper_sdk import resolve_piper_can_interface
 
 MOTOR_NAMES = {
     0x01: "joint_1",
@@ -63,6 +69,7 @@ MOTOR_NAMES = {
 class CANSetupConfig:
     mode: str = "test"
     interfaces: str = "can0"  # Comma-separated, e.g. "can0,can1,can2,can3"
+    usb_can_serials: str | None = None  # Comma-separated USB-CAN serial numbers (PiPER); only with mode=setup
     bitrate: int = 1000000
     data_bitrate: int = 5000000
     use_fd: bool = True
@@ -71,6 +78,13 @@ class CANSetupConfig:
     speed_iterations: int = 100
 
     def get_interfaces(self) -> list[str]:
+        if self.usb_can_serials is not None:
+            if self.mode != "setup":
+                raise ValueError("`usb_can_serials` is only supported with `mode=setup`.")
+            serials = [value.strip() for value in self.usb_can_serials.split(",") if value.strip()]
+            if not serials:
+                raise ValueError("`usb_can_serials` must contain at least one serial number.")
+            return [resolve_piper_can_interface(serial) for serial in serials]
         return [i.strip() for i in self.interfaces.split(",") if i.strip()]
 
 
@@ -93,8 +107,8 @@ def check_interface_status(interface: str) -> tuple[bool, str, bool]:
         return False, "ip command not found", False
 
 
-def setup_interface(interface: str, bitrate: int, data_bitrate: int, use_fd: bool) -> bool:
-    """Configure a CAN interface."""
+def setup_interface(interface: str, bitrate: int, data_bitrate: int, use_fd: bool) -> tuple[bool, str]:
+    """Configure a CAN interface and return (success, error_message)."""
     try:
         subprocess.run(["sudo", "ip", "link", "set", interface, "down"], check=False, capture_output=True)  # nosec B607
 
@@ -104,20 +118,43 @@ def setup_interface(interface: str, bitrate: int, data_bitrate: int, use_fd: boo
 
         result = subprocess.run(cmd, capture_output=True, text=True)  # nosec B607
         if result.returncode != 0:
-            print(f"  ✗ Failed to configure: {result.stderr}")
-            return False
+            err = (result.stderr or result.stdout or "unknown error").strip()
+            return False, f"configure failed: {err}"
 
         result = subprocess.run(  # nosec B607
             ["sudo", "ip", "link", "set", interface, "up"], capture_output=True, text=True
         )
         if result.returncode != 0:
-            print(f"  ✗ Failed to bring up: {result.stderr}")
-            return False
+            err = (result.stderr or result.stdout or "unknown error").strip()
+            return False, f"bring-up failed: {err}"
 
-        return True
+        return True, ""
     except Exception as e:
-        print(f"  ✗ Error: {e}")
-        return False
+        return False, f"exception: {e}"
+
+
+def setup_interface_with_fallback(interface: str, cfg: CANSetupConfig) -> tuple[bool, bool | None, str]:
+    """Try primary mode first, then fallback mode. Returns (success, used_fd, summary)."""
+    is_piper = cfg.usb_can_serials is not None
+    attempts = [False] if is_piper else [cfg.use_fd, not cfg.use_fd]
+    bitrate = 1000000 if is_piper else cfg.bitrate
+    labels = {True: "CAN FD", False: "CAN 2.0"}
+    attempt_msgs: list[str] = []
+
+    for idx, use_fd in enumerate(attempts, start=1):
+        print(f"  Attempt {idx}/{len(attempts)}: {labels[use_fd]}")
+        ok, err = setup_interface(interface, bitrate, cfg.data_bitrate, use_fd)
+        if ok:
+            is_up, status, is_fd_iface = check_interface_status(interface)
+            if is_up:
+                print(f"  ✓ {interface}: {status} (using {labels[use_fd]})")
+                return True, use_fd, labels[use_fd]
+            err = f"interface not up after setup ({status})"
+
+        print(f"    ✗ {err}")
+        attempt_msgs.append(f"{labels[use_fd]} -> {err}")
+
+    return False, None, " | ".join(attempt_msgs)
 
 
 def test_motor(bus, motor_id: int, timeout: float, use_fd: bool):
@@ -152,7 +189,6 @@ def test_motor(bus, motor_id: int, timeout: float, use_fd: bool):
     )
     try:
         bus.send(disable_msg)
-        bus.recv(timeout=0.1)  # Clear any pending responses
     except Exception:
         print(f"Error sending message to motor 0x{motor_id:02X}")
 
@@ -163,7 +199,7 @@ def test_interface(cfg: CANSetupConfig, interface: str):
     """Test all motors on a CAN interface."""
     import can
 
-    is_up, status, _ = check_interface_status(interface)
+    is_up, status, is_fd_iface = check_interface_status(interface)
     print(f"\n{interface}: {status}")
 
     if not is_up:
@@ -171,8 +207,13 @@ def test_interface(cfg: CANSetupConfig, interface: str):
         return {}
 
     try:
+        # Avoid EINVAL on non-FD interfaces.
+        effective_use_fd = cfg.use_fd and is_fd_iface
+        if cfg.use_fd and not is_fd_iface:
+            print("  ⚠ Interface is CAN 2.0; auto-fallback to CAN 2.0 test frames.")
+
         kwargs = {"channel": interface, "interface": "socketcan", "bitrate": cfg.bitrate}
-        if cfg.use_fd:
+        if effective_use_fd:
             kwargs.update({"data_bitrate": cfg.data_bitrate, "fd": True})
         bus = can.interface.Bus(**kwargs)
     except Exception as e:
@@ -181,12 +222,15 @@ def test_interface(cfg: CANSetupConfig, interface: str):
 
     results = {}
     try:
-        while bus.recv(timeout=0.01):
-            pass
+        # Drain stale frames briefly, but never block indefinitely on a busy bus.
+        drain_deadline = time.time() + 0.2
+        while time.time() < drain_deadline:
+            if bus.recv(timeout=0.01) is None:
+                break
 
         for motor_id in cfg.motor_ids:
             motor_name = MOTOR_NAMES.get(motor_id, f"motor_0x{motor_id:02X}")
-            responses, error = test_motor(bus, motor_id, cfg.timeout, cfg.use_fd)
+            responses, error = test_motor(bus, motor_id, cfg.timeout, effective_use_fd)
 
             if error:
                 print(f"  Motor 0x{motor_id:02X} ({motor_name}): ✗ {error}")
@@ -214,7 +258,7 @@ def speed_test(cfg: CANSetupConfig, interface: str):
     """Test communication speed with motors."""
     import can
 
-    is_up, status, _ = check_interface_status(interface)
+    is_up, status, is_fd_iface = check_interface_status(interface)
     if not is_up:
         print(f"{interface}: {status} - skipping")
         return
@@ -222,8 +266,13 @@ def speed_test(cfg: CANSetupConfig, interface: str):
     print(f"\n{interface}: Running speed test ({cfg.speed_iterations} iterations)...")
 
     try:
+        # Avoid EINVAL on non-FD interfaces.
+        effective_use_fd = cfg.use_fd and is_fd_iface
+        if cfg.use_fd and not is_fd_iface:
+            print("  ⚠ Interface is CAN 2.0; auto-fallback to CAN 2.0 test frames.")
+
         kwargs = {"channel": interface, "interface": "socketcan", "bitrate": cfg.bitrate}
-        if cfg.use_fd:
+        if effective_use_fd:
             kwargs.update({"data_bitrate": cfg.data_bitrate, "fd": True})
         bus = can.interface.Bus(**kwargs)
     except Exception as e:
@@ -232,7 +281,7 @@ def speed_test(cfg: CANSetupConfig, interface: str):
 
     responding_motor = None
     for motor_id in cfg.motor_ids:
-        responses, _ = test_motor(bus, motor_id, 0.5, cfg.use_fd)
+        responses, _ = test_motor(bus, motor_id, 0.5, effective_use_fd)
         if responses:
             responding_motor = motor_id
             break
@@ -251,7 +300,7 @@ def speed_test(cfg: CANSetupConfig, interface: str):
             arbitration_id=responding_motor,
             data=[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC],
             is_extended_id=False,
-            is_fd=cfg.use_fd,
+            is_fd=effective_use_fd,
         )
         bus.send(msg)
         resp = bus.recv(timeout=0.1)
@@ -270,29 +319,62 @@ def speed_test(cfg: CANSetupConfig, interface: str):
         print("  ✗ No successful responses")
 
 
-def run_setup(cfg: CANSetupConfig):
+def run_setup(cfg: CANSetupConfig) -> bool:
     """Setup CAN interfaces."""
+    use_fd = False if cfg.usb_can_serials is not None else cfg.use_fd
+    bitrate = 1000000 if cfg.usb_can_serials is not None else cfg.bitrate
     print("=" * 50)
     print("CAN Interface Setup")
     print("=" * 50)
-    print(f"Mode: {'CAN FD' if cfg.use_fd else 'CAN 2.0'}")
-    print(f"Bitrate: {cfg.bitrate / 1_000_000:.1f} Mbps")
-    if cfg.use_fd:
+    print(f"Primary mode: {'CAN FD' if use_fd else 'CAN 2.0'}")
+    if cfg.usb_can_serials is None:
+        print(f"Fallback mode: {'CAN 2.0' if use_fd else 'CAN FD'}")
+    print(f"Bitrate: {bitrate / 1_000_000:.1f} Mbps")
+    if use_fd:
         print(f"Data bitrate: {cfg.data_bitrate / 1_000_000:.1f} Mbps")
     print()
 
     interfaces = cfg.get_interfaces()
+    success_count = 0
+    failed: dict[str, str] = {}
+    mode_map: dict[str, bool] = {}
+
     for interface in interfaces:
         print(f"Configuring {interface}...")
-        if setup_interface(interface, cfg.bitrate, cfg.data_bitrate, cfg.use_fd):
-            is_up, status, _ = check_interface_status(interface)
-            print(f"  ✓ {interface}: {status}")
+        ok, used_fd, summary = setup_interface_with_fallback(interface, cfg)
+        if ok:
+            success_count += 1
+            mode_map[interface] = bool(used_fd)
         else:
-            print(f"  ✗ {interface}: Failed")
+            failed[interface] = summary
+            print(f"  ✗ {interface}: setup failed ({summary})")
 
-    print("\nSetup complete!")
-    print("\nNext: Test motors with:")
-    print(f"  lerobot-setup-can --mode=test --interfaces {','.join(interfaces)}")
+    print()
+    print("=" * 50)
+    print("Setup summary")
+    print("=" * 50)
+    print(f"Interfaces configured: {success_count}/{len(interfaces)}")
+    if mode_map:
+        print("Active mode:")
+        for interface in interfaces:
+            if interface in mode_map:
+                print(f"  - {interface}: {'CAN FD' if mode_map[interface] else 'CAN 2.0'}")
+    if failed:
+        print("Failed interfaces:")
+        for interface in interfaces:
+            if interface in failed:
+                print(f"  - {interface}: {failed[interface]}")
+        print()
+        print("✗ Setup failed")
+        return False
+
+    print()
+    print("✓ Setup succeeded")
+    if cfg.usb_can_serials is None:
+        print()
+        print("Next: Test motors with:")
+        print(f"  lerobot-setup-can --mode=test --interfaces {','.join(interfaces)}")
+    return True
 
 
 def run_test(cfg: CANSetupConfig):
@@ -342,7 +424,9 @@ def setup_can(cfg: CANSetupConfig):
         sys.exit(1)
 
     if cfg.mode == "setup":
-        run_setup(cfg)
+        ok = run_setup(cfg)
+        if not ok:
+            sys.exit(2)
     elif cfg.mode == "test":
         run_test(cfg)
     elif cfg.mode == "speed":

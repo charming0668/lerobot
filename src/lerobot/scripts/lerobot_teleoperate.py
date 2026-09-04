@@ -88,6 +88,7 @@ from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
     bi_openarm_follower,
+    bi_piper_follower,
     bi_rebot_b601_follower,
     bi_so_follower,
     earthrover_mini_plus,
@@ -96,6 +97,7 @@ from lerobot.robots import (  # noqa: F401
     make_robot_from_config,
     omx_follower,
     openarm_follower,
+    piper_follower,
     reachy2,
     rebot_b601_follower,
     so_follower,
@@ -106,6 +108,7 @@ from lerobot.teleoperators import (  # noqa: F401
     TeleoperatorConfig,
     bi_openarm_leader,
     bi_openarm_mini,
+    bi_piper_leader,
     bi_rebot_102_leader,
     bi_so_leader,
     gamepad,
@@ -116,11 +119,13 @@ from lerobot.teleoperators import (  # noqa: F401
     omx_leader,
     openarm_leader,
     openarm_mini,
+    piper_leader,
     reachy2_teleoperator,
     rebot_102_leader,
     so_leader,
     unitree_g1,
 )
+from lerobot.common.control_utils import sanity_check_bimanual_piper_pair
 from lerobot.utils.cycle_timer import CycleTimer
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.utils import init_logging, move_cursor_up
@@ -215,7 +220,6 @@ def teleop_loop(
                 robot_action_to_send = robot_action_processor((teleop_action, obs))
 
             with timer.section("send"):
-                # Send processed action to robot (robot_action_processor.to_output should return RobotAction)
                 _ = robot.send_action(robot_action_to_send)
 
             if display_data:
@@ -252,6 +256,7 @@ def teleop_loop(
 @parser.wrap()
 def teleoperate(cfg: TeleoperateConfig):
     init_logging()
+    sanity_check_bimanual_piper_pair(cfg.robot, cfg.teleop)
     logging.info(pformat(asdict(cfg)))
     if cfg.display_data:
         init_visualization(

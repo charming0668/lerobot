@@ -130,6 +130,7 @@ hardware = [
     "lerobot[pynput-dep]",
     "lerobot[pyserial-dep]",
     "lerobot[deepdiff-dep]",
+    "lerobot[piper]",
 ]
 viz = [
     "rerun-sdk>=0.24.0,<0.34.0",
@@ -179,6 +180,9 @@ feetech = ["feetech-servo-sdk>=1.0.0,<2.0.0", "lerobot[pyserial-dep]", "lerobot[
 dynamixel = ["dynamixel-sdk>=3.7.31,<3.9.0", "lerobot[pyserial-dep]", "lerobot[deepdiff-dep]"]
 damiao = ["lerobot[can-dep]"]
 robstride = ["lerobot[can-dep]"]
+
+# PiPER arm SDK + CAN (single + dual arms, PiPER / PiPER-X)
+piper = ["piper_sdk>=0.6.1,<0.7.0", "lerobot[can-dep]"]
 
 # Robots
 openarms = ["lerobot[damiao]"]

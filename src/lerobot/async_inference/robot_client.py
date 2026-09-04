@@ -79,10 +79,12 @@ from lerobot.policies.rtc.latency_tracker import LatencyTracker
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
+    bi_piper_follower,
     bi_so_follower,
     koch_follower,
     make_robot_from_config,
     omx_follower,
+    piper_follower,
     so_follower,
     unitree_g1,
 )
