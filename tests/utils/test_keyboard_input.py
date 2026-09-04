@@ -132,11 +132,22 @@ def test_pynput_listener_is_trusted(monkeypatch):
 
 # --- Control mapping --------------------------------------------------------
 def test_apply_recording_control():
-    events = {"exit_early": False, "rerecord_episode": False, "stop_recording": False}
+    events = {
+        "exit_early": False,
+        "rerecord_episode": False,
+        "stop_recording": False,
+        "start_episode": False,
+        "go_home": False,
+    }
     apply_recording_control("left", events)
-    assert events == {"exit_early": True, "rerecord_episode": True, "stop_recording": False}
+    assert events["exit_early"] is True
+    assert events["rerecord_episode"] is True
     apply_recording_control("esc", events)
     assert events["stop_recording"] is True
+    apply_recording_control("enter", events)
+    assert events["start_episode"] is True
+    apply_recording_control("space", events)
+    assert events["go_home"] is True
     apply_recording_control("up", events)  # unknown control -> no-op (no error)
 
 
@@ -164,6 +175,8 @@ def _drive(listener, byte_seq):
         (["\x1b"], ["esc"]),  # bare ESC
         (["\x1b", "[", "A"], ["up"]),  # decoded even though the record handler ignores it
         (["n"], ["n"]),  # letter passthrough
+        (["\r"], ["enter"]),
+        ([" "], ["space"]),
     ],
 )
 def test_terminal_parsing(byte_seq, expected):
@@ -190,7 +203,13 @@ def test_init_returns_none_without_tty(monkeypatch):
 
 @pytest.mark.parametrize(
     ("key", "flag"),
-    [("right", "exit_early"), ("r", "rerecord_episode"), ("q", "stop_recording")],
+    [
+        ("right", "exit_early"),
+        ("r", "rerecord_episode"),
+        ("q", "stop_recording"),
+        ("enter", "start_episode"),
+        ("space", "go_home"),
+    ],
 )
 def test_init_terminal_key_routing(monkeypatch, key, flag):
     """Arrows and their letter equivalents drive the same events (terminal backend)."""

@@ -91,6 +91,7 @@ lerobot-record \\
 
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pprint import pformat
 
@@ -250,6 +251,8 @@ def record_loop(
     display_mode: str = "rerun",
     display_compressed_images: bool = False,
     timer: CycleTimer | None = None,
+    extra_break_events: tuple[str, ...] = (),
+    consume_exit_early: bool = True,
 ):
     """Drive the robot from the teleoperator at *fps*, optionally recording each frame.
 
@@ -259,6 +262,11 @@ def record_loop(
     statistics span the whole session and are reported per episode.  Without it each
     call gets a private timer: identical pacing and identical slow-loop warnings, just
     no end-of-run summary, since a single phase has no run to summarise.
+
+    ``control_time_s`` of ``None`` runs until a break event. ``extra_break_events`` names
+    other keys in ``events`` that stop the loop without consuming ``exit_early``.
+    When ``consume_exit_early`` is False, Right/n is swallowed so wait-for-Enter phases
+    ignore it.
     """
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
@@ -294,11 +302,16 @@ def record_loop(
     no_action_count = 0
     timestamp = 0
     start_episode_t = time.perf_counter()
-    while timestamp < control_time_s:
+    limit_s = float("inf") if control_time_s is None else control_time_s
+    while timestamp < limit_s:
         # Checked before `tick()`: this iteration is not a control tick, so it should not
         # be timed as one.
-        if events["exit_early"]:
+        if events.get("exit_early"):
             events["exit_early"] = False
+            if consume_exit_early:
+                break
+
+        if any(events.get(name) for name in extra_break_events):
             break
 
         timer.tick()
@@ -381,6 +394,179 @@ def record_loop(
         timestamp = time.perf_counter() - start_episode_t
 
 
+def _home_robot_and_teleop(
+    robot: Robot,
+    teleop: Teleoperator | list[Teleoperator] | None,
+    settle_s: float,
+    play_sounds: bool,
+) -> None:
+    """Stop software teleop coupling by not calling this from ``record_loop``, then home both sides."""
+    log_say("Homing", play_sounds)
+    home_fns: list = []
+    if teleop is not None and not isinstance(teleop, list) and callable(getattr(teleop, "go_home", None)):
+        home_fns.append(lambda: teleop.go_home(settle_s=settle_s))
+    if callable(getattr(robot, "go_home", None)):
+        home_fns.append(lambda: robot.go_home(settle_s=settle_s))
+    if not home_fns:
+        logging.warning(
+            "Space pressed but neither robot nor teleop implements go_home(); reset the arms manually."
+        )
+        return
+    if len(home_fns) == 1:
+        home_fns[0]()
+        return
+    with ThreadPoolExecutor(max_workers=len(home_fns)) as executor:
+        futures = [executor.submit(fn) for fn in home_fns]
+        for future in futures:
+            future.result()
+
+
+def _record_wait_enter_session(
+    *,
+    cfg: RecordConfig,
+    robot: Robot,
+    teleop: Teleoperator | list[Teleoperator] | None,
+    dataset: LeRobotDataset,
+    events: dict,
+    timer: CycleTimer,
+    teleop_action_processor: RobotProcessorPipeline,
+    robot_action_processor: RobotProcessorPipeline,
+    robot_observation_processor: RobotProcessorPipeline,
+    display_compressed_images: bool,
+) -> None:
+    """Enter → countdown → record → Space home → Enter. See piper数采按键流程设计.md."""
+    loop_kwargs = dict(
+        robot=robot,
+        events=events,
+        fps=cfg.dataset.fps,
+        teleop_action_processor=teleop_action_processor,
+        robot_action_processor=robot_action_processor,
+        robot_observation_processor=robot_observation_processor,
+        teleop=teleop,
+        single_task=cfg.dataset.single_task,
+        display_data=cfg.display_data,
+        display_mode=cfg.display_mode,
+        display_compressed_images=display_compressed_images,
+    )
+    recorded_episodes = 0
+    skip_wait_enter = False
+    episode_time_s = cfg.dataset.episode_time_s if cfg.dataset.episode_time_s > 0 else None
+
+    def idle(*, control_time_s: float | None, extra_break_events: tuple[str, ...]) -> None:
+        record_loop(
+            **loop_kwargs,
+            dataset=None,
+            control_time_s=control_time_s,
+            extra_break_events=extra_break_events,
+            consume_exit_early=False,
+        )
+
+    def maybe_home() -> None:
+        events["go_home"] = False
+        if not cfg.dataset.home_on_space:
+            logging.warning("Space ignored because --dataset.home_on_space=false.")
+            return
+        _home_robot_and_teleop(robot, teleop, cfg.dataset.home_settle_s, cfg.play_sounds)
+
+    while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
+        if not skip_wait_enter:
+            log_say("Press Enter to start, Space to home, Esc to quit", cfg.play_sounds)
+            events["start_episode"] = False
+            events["go_home"] = False
+            events["rerecord_episode"] = False
+            idle(
+                control_time_s=None,
+                extra_break_events=("start_episode", "go_home", "stop_recording"),
+            )
+            events["exit_early"] = False
+            events["rerecord_episode"] = False
+            if events["stop_recording"]:
+                break
+            if events["go_home"]:
+                maybe_home()
+                continue
+            events["start_episode"] = False
+        skip_wait_enter = False
+
+        cancelled_countdown = False
+        while not events["stop_recording"]:
+            countdown_s = cfg.dataset.countdown_s
+            if countdown_s > 0:
+                log_say(f"Recording in {countdown_s:.0f} seconds", cfg.play_sounds)
+            events["start_episode"] = False
+            events["rerecord_episode"] = False
+            events["go_home"] = False
+            idle(
+                control_time_s=countdown_s if countdown_s > 0 else 0,
+                extra_break_events=("start_episode", "rerecord_episode", "stop_recording", "go_home"),
+            )
+            events["go_home"] = False
+            events["exit_early"] = False
+            if events["stop_recording"]:
+                break
+            if events["rerecord_episode"]:
+                events["rerecord_episode"] = False
+                cancelled_countdown = True
+                break
+            if events["start_episode"]:
+                events["start_episode"] = False
+                continue
+            break
+
+        if events["stop_recording"] or cancelled_countdown:
+            continue
+
+        episode_index = dataset.num_episodes
+        log_say(f"Recording episode {episode_index}", cfg.play_sounds)
+        events["go_home"] = False
+        events["start_episode"] = False
+        record_loop(
+            **loop_kwargs,
+            dataset=dataset,
+            control_time_s=episode_time_s,
+            timer=timer,
+        )
+        events["go_home"] = False
+        events["start_episode"] = False
+        events["exit_early"] = False
+
+        if events["rerecord_episode"]:
+            log_say("Discarded episode", cfg.play_sounds)
+            events["rerecord_episode"] = False
+            dataset.clear_episode_buffer()
+            timer.log_episode_summary("discarded episode")
+            timer.restart()
+        elif dataset.has_pending_frames():
+            dataset.save_episode()
+            recorded_episodes += 1
+            timer.log_episode_summary(f"episode {episode_index}")
+            timer.restart()
+        else:
+            logging.info("Episode ended with no frames; nothing to save.")
+            timer.restart()
+
+        if events["stop_recording"]:
+            break
+
+        log_say("Press Space to home, Enter to continue, Esc to quit", cfg.play_sounds)
+        events["go_home"] = False
+        events["start_episode"] = False
+        events["rerecord_episode"] = False
+        idle(
+            control_time_s=None,
+            extra_break_events=("go_home", "start_episode", "stop_recording"),
+        )
+        events["exit_early"] = False
+        events["rerecord_episode"] = False
+        if events["stop_recording"]:
+            break
+        if events["go_home"]:
+            maybe_home()
+        elif events["start_episode"]:
+            events["start_episode"] = False
+            skip_wait_enter = True
+
+
 @parser.wrap()
 def record(
     cfg: RecordConfig,
@@ -431,6 +617,8 @@ def record(
 
     dataset = None
     listener = None
+    events = None
+    session_interrupted = False
     # One timer for the whole session, so its statistics describe the recording rather
     # than one episode's slice of it.  The reset phases below deliberately run on their
     # own private timers: they write no frames, so folding their ticks in would dilute
@@ -495,34 +683,36 @@ def record(
             )
 
         with VideoEncodingManager(dataset):
-            recorded_episodes = 0
-            while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
-                episode_index = dataset.num_episodes
-                log_say(f"Recording episode {episode_index}", cfg.play_sounds)
-                record_loop(
+            wait_enter = cfg.dataset.wait_enter
+            if wait_enter and listener is None:
+                logging.warning(
+                    "wait_enter is set but no keyboard listener is available; "
+                    "falling back to the timed recording loop."
+                )
+                wait_enter = False
+
+            if wait_enter:
+                logging.info(
+                    "Interactive recording: Enter starts (after countdown), Right/n saves, "
+                    "Left/r discards, Space homes, Esc/q quits."
+                )
+                _record_wait_enter_session(
+                    cfg=cfg,
                     robot=robot,
+                    teleop=teleop,
+                    dataset=dataset,
                     events=events,
-                    fps=cfg.dataset.fps,
+                    timer=timer,
                     teleop_action_processor=teleop_action_processor,
                     robot_action_processor=robot_action_processor,
                     robot_observation_processor=robot_observation_processor,
-                    teleop=teleop,
-                    dataset=dataset,
-                    control_time_s=cfg.dataset.episode_time_s,
-                    single_task=cfg.dataset.single_task,
-                    display_data=cfg.display_data,
-                    display_mode=cfg.display_mode,
                     display_compressed_images=display_compressed_images,
-                    timer=timer,
                 )
-
-                # Execute a few seconds without recording to give time to manually reset the environment
-                # Skip reset for the last episode to be recorded
-                if not events["stop_recording"] and (
-                    (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
-                ):
-                    log_say("Reset the environment", cfg.play_sounds)
-
+            else:
+                recorded_episodes = 0
+                while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
+                    episode_index = dataset.num_episodes
+                    log_say(f"Recording episode {episode_index}", cfg.play_sounds)
                     record_loop(
                         robot=robot,
                         events=events,
@@ -531,37 +721,76 @@ def record(
                         robot_action_processor=robot_action_processor,
                         robot_observation_processor=robot_observation_processor,
                         teleop=teleop,
-                        control_time_s=cfg.dataset.reset_time_s,
+                        dataset=dataset,
+                        control_time_s=cfg.dataset.episode_time_s,
                         single_task=cfg.dataset.single_task,
                         display_data=cfg.display_data,
                         display_mode=cfg.display_mode,
                         display_compressed_images=display_compressed_images,
+                        timer=timer,
                     )
 
-                if events["rerecord_episode"]:
-                    log_say("Re-record episode", cfg.play_sounds)
-                    events["rerecord_episode"] = False
-                    events["exit_early"] = False
-                    dataset.clear_episode_buffer()
-                    timer.log_episode_summary("discarded episode")
-                    timer.restart()
-                    continue
+                    # Execute a few seconds without recording to give time to manually reset the environment
+                    # Skip reset for the last episode to be recorded
+                    if not events["stop_recording"] and (
+                        (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
+                    ):
+                        log_say("Reset the environment", cfg.play_sounds)
 
-                dataset.save_episode()
-                recorded_episodes += 1
-                # Close the window on the episode just saved.  The digest is emitted on
-                # the next episode's first tick, so the reset phase, `save_episode` and
-                # the spoken prompts in between are excluded from the cadence instead of
-                # being charged to whichever episode they sit next to.  `restart()` then
-                # exempts that first tick, whose cameras have been idle for seconds.
-                timer.log_episode_summary(f"episode {episode_index}")
-                timer.restart()
+                        record_loop(
+                            robot=robot,
+                            events=events,
+                            fps=cfg.dataset.fps,
+                            teleop_action_processor=teleop_action_processor,
+                            robot_action_processor=robot_action_processor,
+                            robot_observation_processor=robot_observation_processor,
+                            teleop=teleop,
+                            control_time_s=cfg.dataset.reset_time_s,
+                            single_task=cfg.dataset.single_task,
+                            display_data=cfg.display_data,
+                            display_mode=cfg.display_mode,
+                            display_compressed_images=display_compressed_images,
+                        )
+
+                    if events["rerecord_episode"]:
+                        log_say("Re-record episode", cfg.play_sounds)
+                        events["rerecord_episode"] = False
+                        events["exit_early"] = False
+                        dataset.clear_episode_buffer()
+                        timer.log_episode_summary("discarded episode")
+                        timer.restart()
+                        continue
+
+                    dataset.save_episode()
+                    recorded_episodes += 1
+                    # Close the window on the episode just saved.  The digest is emitted on
+                    # the next episode's first tick, so the reset phase, `save_episode` and
+                    # the spoken prompts in between are excluded from the cadence instead of
+                    # being charged to whichever episode they sit next to.  `restart()` then
+                    # exempts that first tick, whose cameras have been idle for seconds.
+                    timer.log_episode_summary(f"episode {episode_index}")
+                    timer.restart()
+    except KeyboardInterrupt:
+        session_interrupted = True
+        raise
     finally:
         # First, and in `finally`: ^C is how most recording sessions end, and the summary
         # is most useful before the video encoding and the hub upload scroll it away.
         timer.log_run_summary()
 
         log_say("Stop recording", cfg.play_sounds, blocking=True)
+
+        if (
+            cfg.dataset.wait_enter
+            and cfg.dataset.home_on_session_end
+            and not session_interrupted
+            and events is not None
+            and events.get("stop_recording")
+        ):
+            try:
+                _home_robot_and_teleop(robot, teleop, cfg.dataset.home_settle_s, cfg.play_sounds)
+            except Exception:
+                logging.exception("home_on_session_end failed")
 
         if dataset:
             dataset.finalize()

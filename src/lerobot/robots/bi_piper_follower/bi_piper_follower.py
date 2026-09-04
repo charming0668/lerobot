@@ -24,6 +24,7 @@ from lerobot.robots.piper_follower import (
     PiperXFollowerConfig,
 )
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
+from lerobot.utils.piper_sdk import run_piper_homes_parallel
 
 from ..robot import Robot
 from .config_bi_piper_follower import BiPiperFollowerConfig, BiPiperXFollowerConfig
@@ -153,6 +154,13 @@ class BiPiperFollower(Robot):
         prefixed_sent_action_left = {f"left_{key}": value for key, value in sent_action_left.items()}
         prefixed_sent_action_right = {f"right_{key}": value for key, value in sent_action_right.items()}
         return {**prefixed_sent_action_left, **prefixed_sent_action_right}
+
+    @check_if_not_connected
+    def go_home(self, settle_s: float = 6.0, period_s: float = 1 / 30) -> None:
+        run_piper_homes_parallel(
+            lambda: self.left_arm.go_home(settle_s=settle_s, period_s=period_s),
+            lambda: self.right_arm.go_home(settle_s=settle_s, period_s=period_s),
+        )
 
     @check_if_not_connected
     def disconnect(self):

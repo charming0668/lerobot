@@ -155,7 +155,8 @@ def apply_recording_control(control: str, events: dict) -> None:
 
     Centralizes the mapping so the ``pynput`` and terminal backends behave
     identically. ``control`` is one of ``"right"`` (end the loop early), ``"left"``
-    (re-record the last episode), or ``"esc"`` (stop recording).
+    (re-record the last episode), ``"esc"`` (stop recording), ``"enter"`` (start the
+    next episode after the countdown), or ``"space"`` (request auto-home).
     """
     if control == "right":
         print("Right arrow key pressed. Exiting loop...")
@@ -168,6 +169,12 @@ def apply_recording_control(control: str, events: dict) -> None:
         print("Escape key pressed. Stopping data recording...")
         events["stop_recording"] = True
         events["exit_early"] = True
+    elif control == "enter":
+        print("Enter key pressed. Start the next episode...")
+        events["start_episode"] = True
+    elif control == "space":
+        print("Space key pressed. Requesting auto-home...")
+        events["go_home"] = True
 
 
 # Terminal arrow keys arrive as a 3-byte escape sequence whose *final* byte identifies
@@ -407,20 +414,23 @@ def init_keyboard_listener():
     * otherwise no listener (non-interactive / piped runs) — recording relies on
       the episode/reset timers (or Ctrl+C).
 
-    Both backends accept the same controls: Right/Left/Esc, plus the single-byte letter
-    equivalents ``n`` (next), ``r`` (re-record) and ``q`` (quit). The letters are the most
-    reliable choice over high-latency SSH/VNC links, where arrow-key escape sequences can
-    be split, delayed, or intercepted by the terminal.
+    Both backends accept the same controls: Right/Left/Esc/Enter/Space, plus the
+    single-byte letter equivalents ``n`` (next), ``r`` (re-record) and ``q`` (quit).
+    The letters are the most reliable choice over high-latency SSH/VNC links, where
+    arrow-key escape sequences can be split, delayed, or intercepted by the terminal.
 
     Returns:
         A tuple ``(listener, events)`` where ``listener`` exposes ``.stop()`` or is
         ``None``, and ``events`` is the dict of flags (``exit_early``,
-        ``rerecord_episode``, ``stop_recording``) set by key presses.
+        ``rerecord_episode``, ``stop_recording``, ``start_episode``, ``go_home``)
+        set by key presses.
     """
     events = {
         "exit_early": False,
         "rerecord_episode": False,
         "stop_recording": False,
+        "start_episode": False,
+        "go_home": False,
     }
 
     # Accept the single-byte letter equivalents n/r/q alongside the arrow/Esc keys: the
@@ -434,7 +444,14 @@ def init_keyboard_listener():
             apply_recording_control("left", events)
         elif key in ("esc", "q"):
             apply_recording_control("esc", events)
+        elif key == "enter":
+            apply_recording_control("enter", events)
+        elif key == "space":
+            apply_recording_control("space", events)
         # other keys (incl. up/down) are intentionally ignored
 
-    listener = create_key_listener(on_key, controls_help="Right/Left/Esc, or n=next, r=re-record, q=quit")
+    listener = create_key_listener(
+        on_key,
+        controls_help="Enter=start, Space=home, Right/n=save, Left/r=discard, Esc/q=quit",
+    )
     return listener, events

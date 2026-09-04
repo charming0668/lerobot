@@ -27,12 +27,14 @@ from lerobot.utils.piper_sdk import (
     PIPER_JOINT_NAMES,
     PIPER_ROLE_FOLLOWER,
     get_piper_sdk,
+    go_zero_joints,
     milli_to_unit,
     parse_piper_log_level,
     resolve_piper_can_interface,
     set_piper_role,
     unit_to_milli,
     wait_enable_piper,
+    wait_piper_joints_near_zero,
 )
 
 from ..robot import Robot
@@ -169,6 +171,17 @@ class PiperFollower(Robot):
             sent_action["gripper.pos"] = milli_to_unit(gripper_pos_raw)
 
         return sent_action
+
+    @check_if_not_connected
+    def go_home(self, settle_s: float = 6.0, period_s: float = 1 / 30) -> None:
+        """Hold joint zeros on this follower CAN until settled. Gripper is left unchanged."""
+        wait_piper_joints_near_zero(
+            self.arm,
+            timeout_s=settle_s,
+            period_s=period_s,
+            on_tick=lambda: go_zero_joints(self.arm),
+        )
+        go_zero_joints(self.arm)
 
     @check_if_not_connected
     def disconnect(self) -> None:

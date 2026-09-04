@@ -28,7 +28,7 @@ from lerobot.teleoperators.piper_leader import (
     PiperXLeaderConfig,
 )
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
-from lerobot.utils.piper_sdk import PIPER_ACTION_KEYS
+from lerobot.utils.piper_sdk import PIPER_ACTION_KEYS, run_piper_homes_parallel
 
 from ..teleoperator import Teleoperator
 from .config_bi_piper_leader import BiPiperLeaderConfig, BiPiperXLeaderConfig
@@ -134,6 +134,9 @@ class _PiperLeaderProcessProxy:
 
     def send_feedback(self, feedback: dict[str, Any]) -> None:
         self._call("send_feedback", feedback)
+
+    def go_home(self, settle_s: float = 6.0) -> None:
+        self._call("go_home", settle_s=settle_s)
 
     def disconnect(self) -> None:
         if self._process is None:
@@ -272,6 +275,13 @@ class BiPiperLeader(Teleoperator):
                 right_feedback[key.removeprefix("right_")] = value
         self.left_arm.send_feedback(left_feedback)
         self.right_arm.send_feedback(right_feedback)
+
+    @check_if_not_connected
+    def go_home(self, settle_s: float = 6.0) -> None:
+        run_piper_homes_parallel(
+            lambda: self.left_arm.go_home(settle_s=settle_s),
+            lambda: self.right_arm.go_home(settle_s=settle_s),
+        )
 
     @check_if_not_connected
     def disconnect(self) -> None:

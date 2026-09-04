@@ -74,6 +74,23 @@ class DatasetRecordConfig:
     # Skip appending the date-time tag to repo_id, keeping the user-provided name as-is
     # (e.g. self-managed versioned names intended for a later `lerobot-edit-dataset merge`).
     no_stamp: bool = False
+    # When True, wait for Enter (then a countdown) before each episode instead of starting
+    # on a timer. Space requests auto-home when the robot/teleop implement ``go_home()``.
+    wait_enter: bool = False
+    # Seconds to wait after Enter before frames are written. Ignored unless wait_enter is True.
+    countdown_s: int | float = 3
+    # Honor Space as auto-home in wait_enter mode.
+    home_on_space: bool = True
+    # How long auto-home may take before giving up and restoring teleop.
+    home_settle_s: int | float = 6
+    # After Esc, run auto-home once before disconnect. Ctrl+C never homes.
+    home_on_session_end: bool = False
+
+    def __post_init__(self) -> None:
+        if self.countdown_s < 0:
+            raise ValueError("`countdown_s` must be >= 0.")
+        if self.home_settle_s < 0:
+            raise ValueError("`home_settle_s` must be >= 0.")
 
     def stamp_repo_id(self) -> None:
         """Append a date-time tag to ``repo_id`` so each recording session gets a unique name.

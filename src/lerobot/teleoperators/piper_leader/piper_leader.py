@@ -30,10 +30,12 @@ from lerobot.utils.piper_sdk import (
     get_piper_sdk,
     milli_to_unit,
     parse_piper_log_level,
+    req_master_arm_home,
     resolve_piper_can_interface,
     set_piper_role,
     unit_to_milli,
     wait_enable_piper,
+    wait_piper_joints_near_zero,
 )
 
 from ..teleoperator import Teleoperator
@@ -257,6 +259,18 @@ class PiperLeader(Teleoperator):
     @check_if_not_connected
     def get_action(self) -> RobotAction:
         return self._read_raw_action()
+
+    @check_if_not_connected
+    def go_home(self, settle_s: float = 6.0) -> None:
+        """Home this leader on its own CAN via ``ReqMasterArmMoveToHome(1)``.
+
+        Does not use mode=2: the follower lives on a different CAN socket.
+        """
+        req_master_arm_home(self.arm, 1)
+        wait_piper_joints_near_zero(self.arm, timeout_s=settle_s)
+        req_master_arm_home(self.arm, 0)
+        self._manual_control_enabled = None
+        self.set_manual_control(True)
 
     @check_if_not_connected
     def send_feedback(self, feedback: dict[str, Any]) -> None:
