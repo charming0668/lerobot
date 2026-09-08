@@ -235,6 +235,50 @@ def test_ready_to_send_observation_with_varying_threshold(robot_client, g_thresh
     assert robot_client._ready_to_send_observation() is expected
 
 
+def test_rtc_merge_skips_nothing_when_no_actions_consumed(robot_client):
+    """First RTC chunk must not drop prefix actions (startup jerk fix)."""
+    from lerobot.async_inference.helpers import TimedAction
+    from lerobot.policies.rtc.action_queue import ActionQueue
+    from lerobot.policies.rtc.configuration_rtc import RTCConfig
+    from lerobot.policies.rtc.latency_tracker import LatencyTracker
+
+    robot_client.config.rtc = RTCConfig(enabled=True, execution_horizon=10)
+    robot_client.rtc_queue = ActionQueue(robot_client.config.rtc)
+    robot_client.latency_tracker = LatencyTracker()
+    robot_client._rtc_index_before = 0
+    robot_client._rtc_request_start = time.perf_counter() - 0.5  # would be ~15 steps at 30fps
+
+    incoming = [
+        TimedAction(
+            timestamp=time.time(),
+            timestep=i,
+            action=torch.full((6,), float(i)),
+            original_action=torch.full((6,), float(i) + 100),
+        )
+        for i in range(10)
+    ]
+    robot_client._merge_rtc_actions(incoming)
+
+    assert robot_client.rtc_queue.qsize() == 10
+    leftover = robot_client.rtc_queue.get_left_over()
+    assert leftover is not None
+    torch.testing.assert_close(leftover[0], torch.full((6,), 100.0))
+
+
+def test_rtc_ready_to_send_waits_while_inflight(robot_client):
+    from lerobot.policies.rtc.action_queue import ActionQueue
+    from lerobot.policies.rtc.configuration_rtc import RTCConfig
+
+    robot_client.config.rtc = RTCConfig(enabled=True)
+    robot_client.rtc_queue = ActionQueue(robot_client.config.rtc)
+    robot_client.action_chunk_size = 20
+    robot_client._rtc_inflight = True
+    assert robot_client._ready_to_send_observation() is False
+
+    robot_client._rtc_inflight = False
+    assert robot_client._ready_to_send_observation() is True
+
+
 # -----------------------------------------------------------------------------
 # Regression test: robot type registry populated by robot_client imports
 # -----------------------------------------------------------------------------

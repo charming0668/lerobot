@@ -168,6 +168,26 @@ def test_timed_data_deserialization_data_getters():
     assert to_out.get_observation().keys() == obs_dict.keys()
     torch.testing.assert_close(to_out.get_observation()[OBS_STATE], obs_dict[OBS_STATE])
 
+    leftover = torch.randn(5, 6)
+    to_rtc = TimedObservation(
+        timestamp=ts,
+        observation=obs_dict,
+        timestep=7,
+        inference_delay=4,
+        prev_chunk_left_over=leftover,
+        execution_horizon=10,
+    )
+    to_rtc_out: TimedObservation = pickle.loads(pickle.dumps(to_rtc))  # nosec B301
+    assert to_rtc_out.inference_delay == 4
+    assert to_rtc_out.execution_horizon == 10
+    torch.testing.assert_close(to_rtc_out.prev_chunk_left_over, leftover)
+
+    ta_rtc = TimedAction(
+        timestamp=ts, action=original_action, timestep=13, original_action=torch.ones(6)
+    )
+    ta_rtc_out: TimedAction = pickle.loads(pickle.dumps(ta_rtc))  # nosec B301
+    torch.testing.assert_close(ta_rtc_out.get_original_action(), torch.ones(6))
+
 
 # ---------------------------------------------------------------------
 # observations_similar()

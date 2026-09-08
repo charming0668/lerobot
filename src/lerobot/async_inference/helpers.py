@@ -221,15 +221,23 @@ class TimedData:
 @dataclass
 class TimedAction(TimedData):
     action: Action
+    # Normalized model-space action used as the next RTC leftover. None when RTC is off.
+    original_action: Action | None = None
 
     def get_action(self):
         return self.action
+
+    def get_original_action(self):
+        return self.action if self.original_action is None else self.original_action
 
 
 @dataclass
 class TimedObservation(TimedData):
     observation: RawObservation
     must_go: bool = False
+    inference_delay: int = 0
+    prev_chunk_left_over: torch.Tensor | None = None
+    execution_horizon: int | None = None
 
     def get_observation(self):
         return self.observation
@@ -271,6 +279,7 @@ class RemotePolicyConfig:
     actions_per_chunk: int
     device: str = "cpu"
     rename_map: dict[str, str] = field(default_factory=dict)
+    rtc_config: Any | None = None
 
 
 def _compare_observation_states(obs1_state: torch.Tensor, obs2_state: torch.Tensor, atol: float) -> bool:

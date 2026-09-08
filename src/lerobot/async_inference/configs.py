@@ -13,10 +13,11 @@
 # limitations under the License.
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 import torch
 
+from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.robots.config import RobotConfig
 
 from .constants import (
@@ -143,6 +144,12 @@ class RobotClientConfig:
         metadata={"help": f"Name of aggregate function to use. Options: {list(AGGREGATE_FUNCTIONS.keys())}"},
     )
 
+    # Real-Time Chunking. Default is off so existing async clients keep weighted_average.
+    rtc: RTCConfig = field(
+        default_factory=lambda: RTCConfig(enabled=False),
+        metadata={"help": "RTC config. Enable with --rtc.enabled=true to send leftover over the wire."},
+    )
+
     # Debug configuration
     debug_visualize_queue_size: bool = field(
         default=False, metadata={"help": "Visualize the action queue size"}
@@ -200,4 +207,5 @@ class RobotClientConfig:
             "task": self.task,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
             "aggregate_fn_name": self.aggregate_fn_name,
+            "rtc": asdict(self.rtc),
         }

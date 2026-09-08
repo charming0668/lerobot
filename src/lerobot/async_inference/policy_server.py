@@ -152,6 +152,19 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
         self.policy.to(self.device)
 
+        rtc_config = getattr(policy_specs, "rtc_config", None)
+        if rtc_config is not None and getattr(rtc_config, "enabled", False):
+            supports_rtc = getattr(self.policy, "supports_rtc", None)
+            if not callable(supports_rtc) or not supports_rtc():
+                raise ValueError(
+                    f"Policy type {self.policy_type} does not support RTC. "
+                    "Use a flow-matching policy (pi0, pi05, smolvla) or disable --rtc.enabled."
+                )
+            self.policy.config.rtc_config = rtc_config
+            if hasattr(self.policy, "init_rtc_processor"):
+                self.policy.init_rtc_processor()
+            self.logger.info("RTC enabled on policy: %s", rtc_config)
+
         # Load preprocessor and postprocessor, overriding device to match requested device
         device_override = {"device": self.device}
         self.preprocessor, self.postprocessor = make_pre_post_processors(
@@ -309,19 +322,86 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         return False
 
-    def _time_action_chunk(self, t_0: float, action_chunk: list[torch.Tensor], i_0: int) -> list[TimedAction]:
+    def _rtc_enabled(self) -> bool:
+        rtc_config = getattr(getattr(self.policy, "config", None), "rtc_config", None)
+        supports_rtc = getattr(self.policy, "supports_rtc", None)
+        return bool(
+            rtc_config is not None
+            and getattr(rtc_config, "enabled", False)
+            and callable(supports_rtc)
+            and supports_rtc()
+        )
+
+    def _prepare_rtc_kwargs(self, observation_t: TimedObservation) -> dict[str, Any]:
+        """Build predict_action_chunk kwargs from the client-provided leftover."""
+        if not self._rtc_enabled():
+            return {}
+
+        inference_delay = int(getattr(observation_t, "inference_delay", 0) or 0)
+        leftover = getattr(observation_t, "prev_chunk_left_over", None)
+        if leftover is not None and leftover.numel() == 0:
+            leftover = None
+        if leftover is not None:
+            leftover = leftover.to(device=self.device)
+
+        training_max_delay = int(getattr(self.policy.config, "rtc_training_max_delay", 0) or 0)
+        rtc_mode = getattr(self.policy.config.rtc_config, "mode", "guided")
+        if rtc_mode == "trained" and training_max_delay > 0 and inference_delay > training_max_delay:
+            self.logger.warning(
+                "Clamping inference_delay=%d to rtc_training_max_delay=%d",
+                inference_delay,
+                training_max_delay,
+            )
+            inference_delay = training_max_delay
+
+        execution_horizon = getattr(observation_t, "execution_horizon", None)
+        if execution_horizon is None:
+            execution_horizon = self.policy.config.rtc_config.execution_horizon
+
+        leftover_shape = None if leftover is None else tuple(leftover.shape)
+        self.logger.info(
+            "RTC inference | delay=%d | leftover=%s | horizon=%s | mode=%s",
+            inference_delay,
+            leftover_shape,
+            execution_horizon,
+            rtc_mode,
+        )
+        return {
+            "inference_delay": inference_delay,
+            "prev_chunk_left_over": leftover,
+            "execution_horizon": execution_horizon,
+        }
+
+    def _time_action_chunk(
+        self,
+        t_0: float,
+        action_chunk: list[torch.Tensor],
+        i_0: int,
+        original_chunk: list[torch.Tensor] | None = None,
+    ) -> list[TimedAction]:
         """Turn a chunk of actions into a list of TimedAction instances,
         with the first action corresponding to t_0 and the rest corresponding to
         t_0 + i*environment_dt for i in range(len(action_chunk))
         """
-        return [
-            TimedAction(timestamp=t_0 + i * self.config.environment_dt, timestep=i_0 + i, action=action)
-            for i, action in enumerate(action_chunk)
-        ]
+        timed = []
+        for i, action in enumerate(action_chunk):
+            original = None if original_chunk is None else original_chunk[i]
+            timed.append(
+                TimedAction(
+                    timestamp=t_0 + i * self.config.environment_dt,
+                    timestep=i_0 + i,
+                    action=action,
+                    original_action=original,
+                )
+            )
+        return timed
 
-    def _get_action_chunk(self, observation: dict[str, torch.Tensor]) -> torch.Tensor:
+    def _get_action_chunk(
+        self, observation: dict[str, torch.Tensor], *, timed_obs: TimedObservation | None = None
+    ) -> torch.Tensor:
         """Get an action chunk from the policy. The chunk contains only"""
-        chunk = self.policy.predict_action_chunk(observation)
+        predict_kwargs = {} if timed_obs is None else self._prepare_rtc_kwargs(timed_obs)
+        chunk = self.policy.predict_action_chunk(observation, **predict_kwargs)
         if chunk.ndim != 3:
             chunk = chunk.unsqueeze(0)  # adding batch dimension, now shape is (B, chunk_size, action_dim)
 
@@ -354,7 +434,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         """3. Get action chunk"""
         start_inference = time.perf_counter()
-        action_tensor = self._get_action_chunk(observation)
+        action_tensor = self._get_action_chunk(observation, timed_obs=observation_t)
         inference_time = time.perf_counter() - start_inference
         self.logger.info(
             f"Preprocessing and inference took {inference_time:.4f}s, action shape: {action_tensor.shape}"
@@ -366,6 +446,9 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         # So we process each action in the chunk individually
         start_postprocess = time.perf_counter()
         _, chunk_size, _ = action_tensor.shape
+
+        # Keep model-space actions for the client's next RTC leftover.
+        original_actions = action_tensor.squeeze(0).detach().cpu()
 
         # Process each action in the chunk
         processed_actions = []
@@ -380,10 +463,14 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.logger.debug(f"Postprocessed action shape: {action_tensor.shape}")
 
         action_tensor = action_tensor.detach().cpu()
+        original_list = list(original_actions) if self._rtc_enabled() else None
 
         """5. Convert to TimedAction list"""
         action_chunk = self._time_action_chunk(
-            observation_t.get_timestamp(), list(action_tensor), observation_t.get_timestep()
+            observation_t.get_timestamp(),
+            list(action_tensor),
+            observation_t.get_timestep(),
+            original_chunk=original_list,
         )
         postprocess_stops = time.perf_counter()
         postprocessing_time = postprocess_stops - start_postprocess

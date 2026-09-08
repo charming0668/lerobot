@@ -203,7 +203,7 @@ def test_predict_action_chunk(monkeypatch, policy_server):
     batch_size = 1
     actions_per_chunk = policy_server.actions_per_chunk
 
-    def _fake_get_action_chunk(_self, _obs, _type="act"):
+    def _fake_get_action_chunk(_self, _obs, **_kwargs):
         return torch.zeros(batch_size, actions_per_chunk, action_dim)
 
     monkeypatch.setattr(PolicyServer, "_get_action_chunk", _fake_get_action_chunk, raising=True)
@@ -217,3 +217,36 @@ def test_predict_action_chunk(monkeypatch, policy_server):
     for i, ta in enumerate(timed_actions):
         expected_ts = obs.get_timestamp() + i * policy_server.config.environment_dt
         assert abs(ta.get_timestamp() - expected_ts) < 1e-6
+
+
+def test_predict_action_chunk_passes_rtc_leftover(policy_server):
+    """When RTC is enabled, leftover and delay are forwarded to predict_action_chunk."""
+    from lerobot.policies.rtc.configuration_rtc import RTCConfig
+
+    captured: dict = {}
+
+    def _recording_predict(observation, **kwargs):
+        captured.update(kwargs)
+        batch_size = 1
+        return torch.zeros(batch_size, policy_server.actions_per_chunk, 6)
+
+    policy_server.policy.predict_action_chunk = _recording_predict
+    policy_server.policy.supports_rtc = lambda: True
+    policy_server.policy.config.rtc_config = RTCConfig(enabled=True, execution_horizon=10)
+    policy_server.preprocessor = lambda obs: obs
+    policy_server.postprocessor = lambda tensor: tensor
+
+    leftover = torch.randn(4, 6)
+    obs = _make_obs(torch.zeros(6), timestep=5)
+    obs.inference_delay = 3
+    obs.prev_chunk_left_over = leftover
+    obs.execution_horizon = 10
+
+    timed_actions = policy_server._predict_action_chunk(obs)
+
+    assert captured["inference_delay"] == 3
+    assert captured["execution_horizon"] == 10
+    torch.testing.assert_close(captured["prev_chunk_left_over"], leftover)
+    assert len(timed_actions) == policy_server.actions_per_chunk
+    assert timed_actions[0].original_action is not None
+    torch.testing.assert_close(timed_actions[0].original_action, torch.zeros(6))
