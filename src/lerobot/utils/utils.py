@@ -49,11 +49,12 @@ def init_logging(
 ):
     """Initialize logging configuration for LeRobot.
 
-    In multi-GPU training, only the main process logs to console to avoid duplicate output.
-    Non-main processes have console logging suppressed but can still log to file.
+    In multi-GPU training, only the main process logs to console and to ``log_file``.
+    Non-main processes have console logging suppressed and do not open the shared log file,
+    so six DDP ranks cannot race on the same file descriptor.
 
     Args:
-        log_file: Optional file path to write logs to
+        log_file: Optional file path to write logs to (main process only when ``accelerator`` is set)
         display_pid: Include process ID in log messages (useful for debugging multi-process)
         console_level: Logging level for console output
         file_level: Logging level for file output
@@ -91,8 +92,10 @@ def init_logging(
         logger.addHandler(logging.NullHandler())
         logger.setLevel(logging.ERROR)
 
-    if log_file is not None:
-        file_handler = logging.FileHandler(log_file)
+    if log_file is not None and is_main_process:
+        log_path = Path(log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
         file_handler.setFormatter(formatter)
         file_handler.setLevel(file_level.upper())
         logger.addHandler(file_handler)

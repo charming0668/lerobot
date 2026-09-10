@@ -34,6 +34,7 @@ import sys
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
+from pathlib import Path
 from pprint import pformat
 from typing import TYPE_CHECKING, Any
 
@@ -415,7 +416,7 @@ def train(cfg: TrainPipelineConfig):
     parallel_dims = ParallelDims.from_config(
         cfg.parallelism, accelerator.num_processes, accelerator.device.type
     )
-    init_logging(accelerator=accelerator)
+    init_logging(log_file=Path("logs/train") / f"{cfg.job_name}.log", accelerator=accelerator)
 
     if is_main_process():
         logging.info(pformat(cfg.to_dict()))
