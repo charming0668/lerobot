@@ -22,19 +22,9 @@ Setup CAN interfaces with CAN FD:
 lerobot-setup-can --mode=setup --interfaces=can0,can1,can2,can3
 ```
 
-Test motors on a single interface:
+Setup PiPER USB-CAN adapters by serial (1 Mbps CAN 2.0, no FD):
 ```shell
-lerobot-setup-can --mode=test --interfaces=can0
-```
-
-Test motors on all interfaces:
-```shell
-lerobot-setup-can --mode=test --interfaces=can0,can1,can2,can3
-```
-
-Speed test:
-```shell
-lerobot-setup-can --mode=speed --interfaces=can0
+lerobot-setup-can --mode=setup --usb_can_serials=SERIAL_1,SERIAL_2,SERIAL_3,SERIAL_4
 ```
 """
 
@@ -46,6 +36,7 @@ from dataclasses import dataclass, field
 import draccus
 
 from lerobot.utils.import_utils import _can_available
+from lerobot.utils.piper_sdk import resolve_piper_can_interface
 
 MOTOR_NAMES = {
     0x01: "joint_1",
@@ -63,6 +54,7 @@ MOTOR_NAMES = {
 class CANSetupConfig:
     mode: str = "test"
     interfaces: str = "can0"  # Comma-separated, e.g. "can0,can1,can2,can3"
+    usb_can_serials: str | None = None
     bitrate: int = 1000000
     data_bitrate: int = 5000000
     use_fd: bool = True
@@ -71,6 +63,13 @@ class CANSetupConfig:
     speed_iterations: int = 100
 
     def get_interfaces(self) -> list[str]:
+        if self.usb_can_serials is not None:
+            if self.mode != "setup":
+                raise ValueError("`usb_can_serials` is only supported with `mode=setup`.")
+            serials = [value.strip() for value in self.usb_can_serials.split(",") if value.strip()]
+            if not serials:
+                raise ValueError("`usb_can_serials` must contain at least one serial number.")
+            return [resolve_piper_can_interface(serial) for serial in serials]
         return [i.strip() for i in self.interfaces.split(",") if i.strip()]
 
 
@@ -272,27 +271,36 @@ def speed_test(cfg: CANSetupConfig, interface: str):
 
 def run_setup(cfg: CANSetupConfig):
     """Setup CAN interfaces."""
+    is_piper = cfg.usb_can_serials is not None
+    use_fd = False if is_piper else cfg.use_fd
+    bitrate = 1000000 if is_piper else cfg.bitrate
     print("=" * 50)
     print("CAN Interface Setup")
     print("=" * 50)
-    print(f"Mode: {'CAN FD' if cfg.use_fd else 'CAN 2.0'}")
-    print(f"Bitrate: {cfg.bitrate / 1_000_000:.1f} Mbps")
-    if cfg.use_fd:
+    print(f"Mode: {'CAN FD' if use_fd else 'CAN 2.0'}")
+    print(f"Bitrate: {bitrate / 1_000_000:.1f} Mbps")
+    if use_fd:
         print(f"Data bitrate: {cfg.data_bitrate / 1_000_000:.1f} Mbps")
     print()
 
     interfaces = cfg.get_interfaces()
+    failed = False
     for interface in interfaces:
         print(f"Configuring {interface}...")
-        if setup_interface(interface, cfg.bitrate, cfg.data_bitrate, cfg.use_fd):
+        if setup_interface(interface, bitrate, cfg.data_bitrate, use_fd):
             is_up, status, _ = check_interface_status(interface)
             print(f"  ✓ {interface}: {status}")
         else:
             print(f"  ✗ {interface}: Failed")
+            failed = True
 
     print("\nSetup complete!")
-    print("\nNext: Test motors with:")
-    print(f"  lerobot-setup-can --mode=test --interfaces {','.join(interfaces)}")
+    if failed:
+        print("✗ One or more interfaces failed")
+        sys.exit(1)
+    if not is_piper:
+        print("\nNext: Test motors with:")
+        print(f"  lerobot-setup-can --mode=test --interfaces {','.join(interfaces)}")
 
 
 def run_test(cfg: CANSetupConfig):

@@ -78,6 +78,18 @@ def make_robot_from_config(config: RobotConfig) -> Robot:
         from .bi_rebot_b601_follower import BiRebotB601Follower
 
         return BiRebotB601Follower(config)
+    elif config.type == "piper_follower":
+        from .piper_follower import PiperFollower
+
+        return PiperFollower(config)
+    elif config.type == "piperx_follower":
+        from .piper_follower import PiperXFollower
+
+        return PiperXFollower(config)
+    elif config.type in {"bi_piper_follower", "bi_piperx_follower"}:
+        from .bi_piper_follower import BiPiperFollower, BiPiperXFollower
+
+        return BiPiperXFollower(config) if config.type == "bi_piperx_follower" else BiPiperFollower(config)
     elif config.type == "mock_robot":
         from tests.mocks.mock_robot import MockRobot
 

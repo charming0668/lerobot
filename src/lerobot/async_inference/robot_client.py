@@ -41,13 +41,16 @@ python src/lerobot/async_inference/robot_client.py \
     --actions_per_chunk=50 \
     --rtc.enabled=true \
     --rtc.mode=trained \
-    --rtc.execution_horizon=20
+    --rtc.execution_horizon=20 \
+    --confirm_chunk=true
 ```
 """
 
+import contextlib
 import logging
 import math
 import pickle  # nosec
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -79,10 +82,12 @@ from lerobot.policies.rtc.latency_tracker import LatencyTracker
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
+    bi_piper_follower,
     bi_so_follower,
     koch_follower,
     make_robot_from_config,
     omx_follower,
+    piper_follower,
     so_follower,
     unitree_g1,
 )
@@ -92,6 +97,7 @@ from lerobot.transport import (
 )
 from lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
 from lerobot.utils.import_utils import register_third_party_plugins
+from lerobot.utils.keyboard_input import TerminalKeyListener, create_key_listener
 
 from .configs import RobotClientConfig
 from .helpers import (
@@ -106,6 +112,7 @@ from .helpers import (
     map_robot_keys_to_lerobot_features,
     visualize_action_queue_size,
 )
+from .trajectory_recorder import TrajectoryRecorder
 
 
 class RobotClient:
@@ -134,6 +141,7 @@ class RobotClient:
             lerobot_features,
             config.actions_per_chunk,
             config.policy_device,
+            rename_map=config.rename_map,
             rtc_config=config.rtc if config.rtc.enabled else None,
         )
         self.channel = grpc.insecure_channel(
@@ -178,6 +186,22 @@ class RobotClient:
         self.must_go = threading.Event()
         self.must_go.set()  # Initially set - observations qualify for direct processing
 
+        self._confirm_listener = None
+        self._enter_go = threading.Event()
+        self._home_go = threading.Event()
+        self._policy_active = False
+        self._chunk_phase = "idle"
+        self._held_action: dict[str, Any] | None = None
+        # Generation counters so a late GetActions after Space/home cannot be executed.
+        self._cmd_gen = 0
+        self._obs_gen = 0
+        self._rx_gen = -1
+        self._traj = TrajectoryRecorder(
+            config.trajectory_dir,
+            enabled=bool(config.record_trajectory and config.confirm_chunk),
+        )
+        self._traj_obs_warned = False
+
     @property
     def running(self):
         return not self.shutdown_event.is_set()
@@ -189,6 +213,12 @@ class RobotClient:
     def start(self):
         """Start the robot client and connect to the policy server"""
         try:
+            self.shutdown_event.clear()
+            if self.config.confirm_chunk:
+                self._start_confirm_chunk_keyboard()
+                if not self._home_robot("startup"):
+                    return False
+
             # client-server handshake
             start_time = time.perf_counter()
             self.stub.Ready(services_pb2.Empty())
@@ -200,17 +230,20 @@ class RobotClient:
             policy_setup = services_pb2.PolicySetup(data=policy_config_bytes)
 
             self.logger.info("Sending policy instructions to policy server")
-            self.logger.debug(
-                f"Policy type: {self.policy_config.policy_type} | "
-                f"Pretrained name or path: {self.policy_config.pretrained_name_or_path} | "
-                f"Device: {self.policy_config.device}"
+            self.logger.info(
+                "Policy handshake | type=%s | path=%s | device=%s | rename_map=%s",
+                self.policy_config.policy_type,
+                self.policy_config.pretrained_name_or_path,
+                self.policy_config.device,
+                self.policy_config.rename_map,
             )
+            if not self.policy_config.rename_map:
+                self.logger.warning(
+                    "rename_map is empty; PolicyServer will not remap camera keys to the checkpoint"
+                )
 
             self.stub.SendPolicyInstructions(policy_setup)
-
-            self.shutdown_event.clear()
-
-            return True
+            return self.running
 
         except grpc.RpcError as e:
             self.logger.error(f"Failed to connect to policy server: {e}")
@@ -218,7 +251,15 @@ class RobotClient:
 
     def stop(self):
         """Stop the robot client"""
+        self._traj.discard_run()
         self.shutdown_event.set()
+        self._enter_go.set()
+        self._home_go.set()
+
+        if self._confirm_listener is not None:
+            with contextlib.suppress(Exception):
+                self._confirm_listener.stop()
+            self._confirm_listener = None
 
         self.robot.disconnect()
         self.logger.debug("Robot disconnected")
@@ -328,12 +369,18 @@ class RobotClient:
         elapsed = time.perf_counter() - request_start
         measured_delay = math.ceil(elapsed / self.config.environment_dt)
         consumed = max(0, self.rtc_queue.get_action_index() - index_before)
+        if self.config.confirm_chunk:
+            with self._rtc_lock:
+                if self._obs_gen != self._cmd_gen:
+                    self.logger.info("Dropping action chunk from an aborted request")
+                    return
+                self._rx_gen = self._obs_gen
         # First chunk (nothing consumed yet) must not skip the prefix — that caused a startup jerk.
         merge_delay = 0 if consumed == 0 else measured_delay
-
-        self.rtc_queue.merge(original, processed, merge_delay, index_before)
         if self.latency_tracker is not None:
             self.latency_tracker.add(elapsed)
+
+        self.rtc_queue.merge(original, processed, merge_delay, index_before)
         self.logger.debug(
             "RTC merge | delay=%d (consumed=%d, measured=%d) | queue=%d",
             merge_delay,
@@ -447,6 +494,14 @@ class RobotClient:
         with self.action_queue_lock:
             return not self.action_queue.empty()
 
+    def _chunk_ready_for_current_request(self) -> bool:
+        """True only for the chunk that matches the latest Enter, not a leftover after home."""
+        if not self.actions_available():
+            return False
+        if not self.config.confirm_chunk:
+            return True
+        return self._rx_gen == self._obs_gen == self._cmd_gen
+
     def _action_tensor_to_action_dict(self, action_tensor: torch.Tensor) -> dict[str, float]:
         action = {key: action_tensor[i].item() for i, key in enumerate(self.robot.action_features)}
         return action
@@ -473,6 +528,8 @@ class RobotClient:
             timed_timestep = timed_action.get_timestep()
 
         _performed_action = self.robot.send_action(self._action_tensor_to_action_dict(action_tensor))
+        if self._traj.active:
+            self._traj.append(_performed_action, self._read_measured_state())
         with self.latest_action_lock:
             if timed_timestep is None:
                 self.latest_action += 1
@@ -529,6 +586,8 @@ class RobotClient:
                     inference_delay = math.ceil(max_latency / self.config.environment_dt)
                 execution_horizon = self.config.rtc.execution_horizon
                 with self._rtc_lock:
+                    if self.config.confirm_chunk:
+                        self._obs_gen = self._cmd_gen
                     self._rtc_index_before = self.rtc_queue.get_action_index()
                     self._rtc_request_start = time.perf_counter()
                     self._rtc_inflight = True
@@ -585,6 +644,149 @@ class RobotClient:
                     self._rtc_inflight = False
             self.logger.error(f"Error in observation sender: {e}")
 
+    def _on_confirm_key(self, name: str) -> None:
+        key = name.lower()
+        if key == "enter":
+            self._enter_go.set()
+            self.logger.info("Enter: toggle run/pause")
+        elif key == "space":
+            self._home_go.set()
+            self.logger.info("Space: will go home, then wait for Enter")
+        elif key in {"esc", "q"}:
+            self.logger.info("Stop key pressed")
+            self.shutdown_event.set()
+            self._enter_go.set()
+
+    def _start_confirm_chunk_keyboard(self) -> None:
+        # Terminal-only: pynput is global on X11 and would treat Space in any window as home.
+        if sys.stdin.isatty():
+            listener = TerminalKeyListener(self._on_confirm_key)
+            listener.start()
+            self._confirm_listener = listener
+            self.logger.info(
+                "Using terminal keyboard — keep this terminal focused "
+                "(Enter=run/pause, Space=home, q/Esc=stop)."
+            )
+        else:
+            self._confirm_listener = create_key_listener(
+                self._on_confirm_key,
+                controls_help="Enter=run/pause, Space=home, q/Esc=stop",
+            )
+            if self._confirm_listener is None:
+                self.logger.warning(
+                    "confirm_chunk is on but no keyboard is available; the robot will hold and wait"
+                )
+        self.logger.info("Safety gate: homing, then Enter=start/pause, Space=home, q/Esc=stop")
+        if self._traj.enabled:
+            self.logger.info(
+                "Trajectory recording on: each Enter→Enter run saves CSV+PNG under %s",
+                self.config.trajectory_dir,
+            )
+
+    def _read_measured_state(self) -> dict[str, Any]:
+        """Joint/gripper readings only. Missing method or a failed read returns {}."""
+        getter = getattr(self.robot, "get_proprioception", None)
+        if getter is None:
+            return {}
+        try:
+            return getter()
+        except Exception:
+            if not self._traj_obs_warned:
+                self.logger.warning("get_proprioception failed; trajectory will record commands only")
+                self._traj_obs_warned = True
+            return {}
+
+    def _hold_last_action(self) -> None:
+        if self._held_action is not None:
+            self.robot.send_action(self._held_action)
+
+    def _clear_action_state(self, *, keep_hold: bool = False) -> None:
+        """Drop queued/in-flight actions so a later Enter starts a fresh request."""
+        with self._rtc_lock:
+            self._cmd_gen += 1
+            self._rtc_inflight = False
+            self._rtc_index_before = 0
+        if self.rtc_enabled and self.rtc_queue is not None:
+            self.rtc_queue.clear()
+        with self.action_queue_lock:
+            self.action_queue = Queue()
+        if not keep_hold:
+            self._held_action = None
+        self.must_go.set()
+
+    def _pause_in_place(self) -> None:
+        """Stop policy requests and hold the last commanded pose. No home, no EmergencyStop."""
+        self._policy_active = False
+        held = self._held_action
+        self._clear_action_state(keep_hold=True)
+        self._held_action = held
+        self._chunk_phase = "idle"
+        self.logger.info("Paused at current pose. Enter=resume, Space=home, q=stop")
+
+    def _home_robot(self, reason: str) -> bool:
+        """Go to joint zeros, then idle. Does not send a policy observation.
+
+        Piper followers wait the full ``go_home`` settle (default 6s) at reduced
+        MOVE_J speed, same as ``lerobot-record`` Space-home. Success is fail-closed.
+        """
+        self.logger.info("Homing (%s); waiting for joints to settle...", reason)
+        self._policy_active = False
+        self._clear_action_state()
+        go_home = getattr(self.robot, "go_home", None)
+        settled = True
+        if go_home is None:
+            self.logger.warning("robot has no go_home(); holding in place")
+        else:
+            result = go_home()
+            if result is False:
+                settled = False
+        # Drop any chunk that arrived on the receiver thread while homing.
+        self._clear_action_state()
+        self._chunk_phase = "idle"
+        self._enter_go.clear()
+        self._home_go.clear()
+        if not settled:
+            self.logger.error(
+                "Homing failed: joints not near zero after settle. "
+                "CAN may be DOWN or the arm did not reach zero in time. Not starting motion."
+            )
+            self.shutdown_event.set()
+            return False
+        self.logger.info("At home. Press Enter to start, Space to home again, q to stop")
+        return True
+
+    def _control_loop_confirm_chunk(self, task: str, verbose: bool) -> None:
+        """Enter toggles continuous policy. Space homes. Pause holds the last pose."""
+        if not self.running:
+            return
+        if self._home_go.is_set():
+            self._home_go.clear()
+            self._enter_go.clear()
+            self._traj.discard_run()
+            self._home_robot("space")
+            return
+        if self._enter_go.is_set():
+            self._enter_go.clear()
+            if self._policy_active:
+                self._pause_in_place()
+                self._traj.finish_run()
+            else:
+                self._policy_active = True
+                self._traj.start_run()
+                self.must_go.set()
+                self.logger.info("Running policy continuously. Enter=pause, Space=home, q=stop")
+
+        if self._policy_active:
+            if self.actions_available():
+                performed = self.control_loop_action(verbose)
+                if performed:
+                    self._held_action = performed
+            if self._ready_to_send_observation():
+                self.control_loop_observation(task, verbose)
+            return
+
+        self._hold_last_action()
+
     def control_loop(self, task: str, verbose: bool = False) -> tuple[Observation, Action]:
         """Combined function for executing actions and streaming observations"""
         # Wait at barrier for synchronized start
@@ -596,13 +798,16 @@ class RobotClient:
 
         while self.running:
             control_loop_start = time.perf_counter()
-            """Control loop: (1) Performing actions, when available"""
-            if self.actions_available():
-                _performed_action = self.control_loop_action(verbose)
+            if self.config.confirm_chunk:
+                self._control_loop_confirm_chunk(task, verbose)
+            else:
+                """Control loop: (1) Performing actions, when available"""
+                if self.actions_available():
+                    _performed_action = self.control_loop_action(verbose)
 
-            """Control loop: (2) Streaming observations to the remote policy server"""
-            if self._ready_to_send_observation():
-                _captured_observation = self.control_loop_observation(task, verbose)
+                """Control loop: (2) Streaming observations to the remote policy server"""
+                if self._ready_to_send_observation():
+                    _captured_observation = self.control_loop_observation(task, verbose)
 
             self.logger.debug(f"Control loop (ms): {(time.perf_counter() - control_loop_start) * 1000:.2f}")
             # Dynamically adjust sleep time to maintain the desired control frequency
@@ -621,25 +826,25 @@ def async_client(cfg: RobotClientConfig):
 
     client = RobotClient(cfg)
 
-    if client.start():
+    try:
+        if not client.start():
+            return
+
         client.logger.info("Starting action receiver thread...")
-
-        # Create and start action receiver thread
         action_receiver_thread = threading.Thread(target=client.receive_actions, daemon=True)
-
-        # Start action receiver thread
         action_receiver_thread.start()
 
         try:
-            # The main thread runs the control loop
             client.control_loop(task=cfg.task)
-
         finally:
             client.stop()
-            action_receiver_thread.join()
+            action_receiver_thread.join(timeout=5.0)
             if cfg.debug_visualize_queue_size:
                 visualize_action_queue_size(client.action_queue_size)
             client.logger.info("Client stopped")
+    finally:
+        if client.robot.is_connected:
+            client.stop()
 
 
 if __name__ == "__main__":

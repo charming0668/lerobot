@@ -19,6 +19,7 @@ no real hardware is accessed. Only the queue-update mechanism is verified.
 
 from __future__ import annotations
 
+import csv
 import time
 from queue import Queue
 
@@ -265,6 +266,65 @@ def test_rtc_merge_skips_nothing_when_no_actions_consumed(robot_client):
     torch.testing.assert_close(leftover[0], torch.full((6,), 100.0))
 
 
+def test_remote_policy_config_forwards_rename_map():
+    import pickle
+
+    from lerobot.async_inference.configs import RobotClientConfig
+    from lerobot.async_inference.robot_client import RobotClient
+    from tests.mocks.mock_robot import MockRobotConfig
+
+    rename_map = {
+        "observation.images.left_wrist": "observation.images.left_wrist_0_rgb",
+        "observation.images.right_wrist": "observation.images.right_wrist_0_rgb",
+        "observation.images.right_front": "observation.images.base_0_rgb",
+    }
+    cfg = RobotClientConfig(
+        robot=MockRobotConfig(),
+        server_address="localhost:9999",
+        policy_type="test",
+        pretrained_name_or_path="test",
+        actions_per_chunk=20,
+        rename_map=rename_map,
+        confirm_chunk=True,
+    )
+    client = RobotClient(cfg)
+    try:
+        assert client.policy_config.rename_map == rename_map
+        assert pickle.loads(pickle.dumps(client.policy_config)).rename_map == rename_map
+    finally:
+        if client.robot.is_connected:
+            client.stop()
+
+
+def test_confirm_chunk_merge_ignores_wall_clock_rtt(robot_client):
+    """First RTC chunk (consumed==0) must not drop prefix even if wall clock is large."""
+    from lerobot.async_inference.helpers import TimedAction
+    from lerobot.policies.rtc.action_queue import ActionQueue
+    from lerobot.policies.rtc.configuration_rtc import RTCConfig
+    from lerobot.policies.rtc.latency_tracker import LatencyTracker
+
+    robot_client.config.confirm_chunk = True
+    robot_client.config.rtc = RTCConfig(enabled=True, mode="trained", execution_horizon=10)
+    robot_client.rtc_queue = ActionQueue(robot_client.config.rtc)
+    robot_client.latency_tracker = LatencyTracker()
+    robot_client._rtc_index_before = 0
+    # 5s * 30fps = 150 steps; if wall clock leaked into merge_delay, the chunk would be skipped.
+    robot_client._rtc_request_start = time.perf_counter() - 5.0
+
+    incoming = [
+        TimedAction(
+            timestamp=time.time(),
+            timestep=i,
+            action=torch.full((6,), float(i)),
+            original_action=torch.full((6,), float(i)),
+        )
+        for i in range(50)
+    ]
+    robot_client._merge_rtc_actions(incoming)
+
+    assert robot_client.rtc_queue.qsize() == 50
+
+
 def test_rtc_ready_to_send_waits_while_inflight(robot_client):
     from lerobot.policies.rtc.action_queue import ActionQueue
     from lerobot.policies.rtc.configuration_rtc import RTCConfig
@@ -277,6 +337,157 @@ def test_rtc_ready_to_send_waits_while_inflight(robot_client):
 
     robot_client._rtc_inflight = False
     assert robot_client._ready_to_send_observation() is True
+
+
+def test_confirm_keys_enter_space_q(robot_client):
+    robot_client.config.confirm_chunk = True
+    robot_client._on_confirm_key("enter")
+    assert robot_client._enter_go.is_set()
+    assert not robot_client._home_go.is_set()
+    assert not robot_client.shutdown_event.is_set()
+
+    robot_client._enter_go.clear()
+    robot_client._on_confirm_key("n")
+    assert not robot_client._enter_go.is_set()
+
+    robot_client._on_confirm_key("space")
+    assert robot_client._home_go.is_set()
+    assert not robot_client.shutdown_event.is_set()
+
+    robot_client._home_go.clear()
+    robot_client._on_confirm_key("q")
+    assert robot_client.shutdown_event.is_set()
+    assert not robot_client._home_go.is_set()
+
+
+def test_enter_toggles_policy_and_pause_keeps_hold(robot_client):
+    robot_client.config.confirm_chunk = True
+    robot_client._held_action = {"joint_1.pos": 1.0}
+    robot_client.control_loop_observation = lambda *args, **kwargs: None
+    robot_client.control_loop_action = lambda *args, **kwargs: {}
+
+    robot_client._enter_go.set()
+    robot_client._control_loop_confirm_chunk(task="t", verbose=False)
+    assert robot_client._policy_active is True
+
+    robot_client._enter_go.set()
+    robot_client._control_loop_confirm_chunk(task="t", verbose=False)
+    assert robot_client._policy_active is False
+    assert robot_client._held_action == {"joint_1.pos": 1.0}
+
+
+def test_home_without_go_home_clears_held_action(robot_client):
+    robot_client._held_action = {"joint_1.pos": 1.0}
+    robot_client._policy_active = True
+    robot_client._enter_go.set()
+    robot_client._home_robot("test")
+    assert robot_client._held_action is None
+    assert robot_client._policy_active is False
+    assert robot_client._chunk_phase == "idle"
+    assert not robot_client._enter_go.is_set()
+    assert not robot_client._home_go.is_set()
+
+
+def test_home_fails_closed_when_go_home_returns_false(robot_client):
+    robot_client.robot.go_home = lambda: False
+    robot_client._policy_active = True
+    robot_client._enter_go.set()
+    assert robot_client._home_robot("test") is False
+    assert robot_client.shutdown_event.is_set()
+    assert robot_client._policy_active is False
+    assert not robot_client._enter_go.is_set()
+
+
+def _enable_traj(robot_client, tmp_path):
+    from lerobot.async_inference.trajectory_recorder import TrajectoryRecorder
+
+    robot_client.config.confirm_chunk = True
+    robot_client._traj = TrajectoryRecorder(tmp_path, enabled=True)
+    robot_client.control_loop_observation = lambda *args, **kwargs: None
+    return robot_client._traj
+
+
+def _queue_action(robot_client, values=(0.1, 0.2, 0.3)):
+    from lerobot.async_inference.helpers import TimedAction
+
+    robot_client.action_queue.put(
+        TimedAction(timestamp=time.time(), timestep=0, action=torch.tensor(values, dtype=torch.float32))
+    )
+
+
+def test_enter_enter_saves_executed_trajectory(robot_client, tmp_path):
+    _enable_traj(robot_client, tmp_path)
+    robot_client._enter_go.set()
+    robot_client._control_loop_confirm_chunk(task="t", verbose=False)
+    assert robot_client._traj.active is True
+
+    _queue_action(robot_client)
+    robot_client._control_loop_confirm_chunk(task="t", verbose=False)
+    assert robot_client._traj.n_steps == 1
+
+    robot_client._enter_go.set()
+    robot_client._control_loop_confirm_chunk(task="t", verbose=False)
+    assert robot_client._policy_active is False
+    assert robot_client._traj.active is False
+    csvs = list(tmp_path.rglob("run_001.csv"))
+    assert len(csvs) == 1
+    with csvs[0].open() as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 1
+    assert "cmd.motor_1.pos" in rows[0]
+
+    robot_client._control_loop_confirm_chunk(task="t", verbose=False)
+    assert [p.name for p in tmp_path.rglob("run_*.csv")] == ["run_001.csv"]
+
+
+def test_space_before_second_enter_discards_trajectory(robot_client, tmp_path):
+    _enable_traj(robot_client, tmp_path)
+    robot_client._enter_go.set()
+    robot_client._control_loop_confirm_chunk(task="t", verbose=False)
+    _queue_action(robot_client)
+    robot_client._control_loop_confirm_chunk(task="t", verbose=False)
+    assert robot_client._traj.n_steps == 1
+
+    robot_client._home_go.set()
+    robot_client._control_loop_confirm_chunk(task="t", verbose=False)
+    assert robot_client._traj.active is False
+    assert list(tmp_path.rglob("*.csv")) == []
+
+
+def test_stop_before_second_enter_discards_trajectory(robot_client, tmp_path):
+    _enable_traj(robot_client, tmp_path)
+    robot_client._enter_go.set()
+    robot_client._control_loop_confirm_chunk(task="t", verbose=False)
+    _queue_action(robot_client)
+    robot_client._control_loop_confirm_chunk(task="t", verbose=False)
+    robot_client.stop()
+    assert robot_client._traj.active is False
+    assert list(tmp_path.rglob("*.csv")) == []
+
+
+def test_confirm_chunk_drops_aborted_request(robot_client):
+    from lerobot.async_inference.helpers import TimedAction
+    from lerobot.policies.rtc.action_queue import ActionQueue
+    from lerobot.policies.rtc.configuration_rtc import RTCConfig
+
+    robot_client.config.confirm_chunk = True
+    robot_client.config.rtc = RTCConfig(enabled=True, mode="trained", execution_horizon=10)
+    robot_client.rtc_queue = ActionQueue(robot_client.config.rtc)
+    robot_client._cmd_gen = 2
+    robot_client._obs_gen = 1
+    robot_client._rtc_index_before = 0
+    robot_client._rtc_request_start = time.perf_counter()
+    incoming = [
+        TimedAction(
+            timestamp=time.time(),
+            timestep=i,
+            action=torch.full((6,), float(i)),
+            original_action=torch.full((6,), float(i)),
+        )
+        for i in range(50)
+    ]
+    robot_client._merge_rtc_actions(incoming)
+    assert robot_client.rtc_queue.qsize() == 0
 
 
 # -----------------------------------------------------------------------------
