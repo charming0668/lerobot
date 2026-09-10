@@ -65,6 +65,30 @@ class PolicyServerConfig:
         default=DEFAULT_OBS_QUEUE_TIMEOUT, metadata={"help": "Timeout for observation queue in seconds"}
     )
 
+    # Optional server-side model preload. When set, the server loads the checkpoint,
+    # optionally runs a dummy forward pass, then opens the gRPC port. Clients can
+    # still send SendPolicyInstructions to apply rename_map / RTC without reloading weights.
+    pretrained_path: str | None = field(
+        default=None,
+        metadata={"help": "Checkpoint directory to load before accepting clients. Empty keeps the old handshake load."},
+    )
+    policy_type: str | None = field(
+        default=None,
+        metadata={"help": "Policy type (pi05, smolvla, ...). Inferred from checkpoint config.json when omitted."},
+    )
+    device: str = field(default="cuda", metadata={"help": "Device for a preloaded policy"})
+    actions_per_chunk: int = field(
+        default=50, metadata={"help": "Action chunk length used for warmup and as the default until the client connects"}
+    )
+    warmup: bool = field(
+        default=True, metadata={"help": "Run a dummy inference after preload and refuse to listen if it fails"}
+    )
+    warmup_task: str = field(default="warmup", metadata={"help": "Language task string used for dummy inference"})
+    ready_file: str = field(
+        default="logs/policy_server.ready",
+        metadata={"help": "Marker file written after warmup succeeds and removed on shutdown"},
+    )
+
     def __post_init__(self):
         """Validate configuration after initialization."""
         if self.port < 1 or self.port > 65535:

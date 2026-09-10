@@ -250,3 +250,17 @@ def test_predict_action_chunk_passes_rtc_leftover(policy_server):
     assert len(timed_actions) == policy_server.actions_per_chunk
     assert timed_actions[0].original_action is not None
     torch.testing.assert_close(timed_actions[0].original_action, torch.zeros(6))
+
+
+def test_mark_ready_writes_marker(tmp_path):
+    from lerobot.async_inference.configs import PolicyServerConfig
+    from lerobot.async_inference.policy_server import PolicyServer
+
+    ready_file = tmp_path / "policy_server.ready"
+    server = PolicyServer(PolicyServerConfig(host="127.0.0.1", port=18080, ready_file=str(ready_file)))
+    server._preloaded_path = "/tmp/ckpt"
+    server.mark_ready()
+
+    assert server._model_ready is True
+    assert ready_file.is_file()
+    assert "ready" in ready_file.read_text(encoding="utf-8")
