@@ -834,6 +834,16 @@ class TaskMetrics(TypedDict):
 ACC_KEYS = ("sum_rewards", "max_rewards", "successes", "video_paths", "predicted_video_paths")
 
 
+def _empty_task_metrics() -> TaskMetrics:
+    return {
+        "sum_rewards": [],
+        "max_rewards": [],
+        "successes": [],
+        "video_paths": [],
+        "predicted_video_paths": [],
+    }
+
+
 def eval_one(
     env: gym.vector.VectorEnv,
     *,
@@ -1041,6 +1051,16 @@ def eval_policy_all(
                     tg, tid, metrics = task_runner(task_group, task_id, env)
                     _accumulate_to(tg, metrics)
                     per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
+                except Exception:
+                    logger.exception("Eval failed for task_group=%s task_id=%s; continuing", task_group, task_id)
+                    per_task_infos.append(
+                        {
+                            "task_group": task_group,
+                            "task_id": task_id,
+                            "metrics": _empty_task_metrics(),
+                            "error": True,
+                        }
+                    )
                 finally:
                     env.close()
                     # Prefetch next task's workers *after* closing current env to prevent
@@ -1062,6 +1082,18 @@ def eval_policy_all(
                         tg, tid, metrics = fut.result()
                         _accumulate_to(tg, metrics)
                         per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
+                    except Exception:
+                        logger.exception(
+                            "Eval failed for task_group=%s task_id=%s; continuing", task_group, task_id
+                        )
+                        per_task_infos.append(
+                            {
+                                "task_group": task_group,
+                                "task_id": task_id,
+                                "metrics": _empty_task_metrics(),
+                                "error": True,
+                            }
+                        )
                     finally:
                         env.close()
     finally:

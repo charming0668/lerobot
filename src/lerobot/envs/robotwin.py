@@ -94,6 +94,26 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+# RoboTwin raises this from setup_demo when randomized object poses fail a physics
+# stability check. Official eval_policy.py retries with seed+1; we do the same.
+_UNSTABLE_ERROR_NAME = "UnStableError"
+_MAX_UNSTABLE_SEED_RETRIES = 25
+
+
+def _is_unstable_error(exc: BaseException) -> bool:
+    return type(exc).__name__ == _UNSTABLE_ERROR_NAME
+
+
+def _close_robotwin_task_env(task_env: Any) -> None:
+    close = getattr(task_env, "close_env", None)
+    if close is None:
+        return
+    try:
+        close()
+    except Exception:
+        logger.debug("close_env after UnStableError failed", exc_info=True)
+
+
 def _arm_for_block(block: Any) -> str:
     return "left" if float(block.get_pose().p[0]) < 0 else "right"
 
@@ -467,11 +487,32 @@ class RoboTwinEnv(gym.Env):
         super().reset(seed=seed)
         assert self._env is not None  # set by _ensure_env() above
 
-        actual_seed = self.episode_index if seed is None else seed
+        actual_seed = self.episode_index if seed is None else int(seed)
         setup_kwargs = _load_robotwin_setup_kwargs(self.task_name)
-        setup_kwargs.update(seed=actual_seed, is_test=True)
-        with torch.enable_grad():
-            self._env.setup_demo(**setup_kwargs)
+        last_unstable: BaseException | None = None
+        for attempt in range(_MAX_UNSTABLE_SEED_RETRIES):
+            setup_kwargs.update(seed=actual_seed, is_test=True)
+            try:
+                with torch.enable_grad():
+                    self._env.setup_demo(**setup_kwargs)
+                last_unstable = None
+                break
+            except Exception as exc:
+                if not _is_unstable_error(exc):
+                    raise
+                last_unstable = exc
+                logger.warning(
+                    "RoboTwin UnStableError on %s seed=%s (%s/%s): %s",
+                    self.task_name,
+                    actual_seed,
+                    attempt + 1,
+                    _MAX_UNSTABLE_SEED_RETRIES,
+                    exc,
+                )
+                _close_robotwin_task_env(self._env)
+                actual_seed += 1
+        if last_unstable is not None:
+            raise last_unstable
         self.episode_index += self._reset_stride
         self._step_count = 0
 

@@ -34,6 +34,7 @@ from lerobot.envs.robotwin import (
     ROBOTWIN_CAMERA_NAMES,
     ROBOTWIN_TASKS,
     RoboTwinEnv,
+    _MAX_UNSTABLE_SEED_RETRIES,
     create_robotwin_envs,
 )
 
@@ -142,6 +143,31 @@ class TestRoboTwinEnv:
         call_kwargs = mock_task.setup_demo.call_args.kwargs
         assert call_kwargs["seed"] == 42
         assert call_kwargs["is_test"] is True
+
+    def test_reset_retries_unstable_seed(self):
+        class UnStableError(Exception):
+            pass
+
+        mock_task = _make_mock_task_env()
+        mock_task.setup_demo.side_effect = [UnStableError("001_bottle"), None]
+        env = RoboTwinEnv(task_name="adjust_bottle")
+        with _patch_runtime(mock_task):
+            env.reset(seed=1001)
+        assert mock_task.setup_demo.call_count == 2
+        assert mock_task.setup_demo.call_args_list[0].kwargs["seed"] == 1001
+        assert mock_task.setup_demo.call_args_list[1].kwargs["seed"] == 1002
+        mock_task.close_env.assert_called()
+
+    def test_reset_reraises_after_unstable_retries_exhausted(self):
+        class UnStableError(Exception):
+            pass
+
+        mock_task = _make_mock_task_env()
+        mock_task.setup_demo.side_effect = UnStableError("still unstable")
+        env = RoboTwinEnv(task_name="adjust_bottle")
+        with _patch_runtime(mock_task), pytest.raises(UnStableError, match="still unstable"):
+            env.reset(seed=0)
+        assert mock_task.setup_demo.call_count == _MAX_UNSTABLE_SEED_RETRIES
 
     def test_step_returns_correct_types(self):
         mock_task = _make_mock_task_env()
