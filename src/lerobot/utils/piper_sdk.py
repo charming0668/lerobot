@@ -172,17 +172,16 @@ def wait_piper_joints_near_zero(
     """
     deadline = time.monotonic() + max(0.0, timeout_s)
     interval_s = max(0.01, period_s)
-    reached = False
+    near_zero = False
     while True:
         if on_tick is not None:
             on_tick()
-        if piper_joints_near_zero(arm, tolerance_deg=tolerance_deg):
-            reached = True
-            if stop_on_near_zero:
-                return True
+        near_zero = piper_joints_near_zero(arm, tolerance_deg=tolerance_deg)
+        if near_zero and stop_on_near_zero:
+            return True
         remaining_s = deadline - time.monotonic()
         if remaining_s <= 0:
-            return reached
+            return near_zero
         time.sleep(min(interval_s, remaining_s))
 
 

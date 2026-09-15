@@ -131,6 +131,16 @@ class BiPiperFollower(Robot):
         self.right_arm.setup_motors()
 
     @check_if_not_connected
+    def get_proprioception(self) -> RobotObservation:
+        """Joint and gripper state from both arms; no camera frames."""
+        obs_dict: RobotObservation = {}
+        left_obs = self.left_arm.get_proprioception()
+        obs_dict.update({f"left_{key}": value for key, value in left_obs.items()})
+        right_obs = self.right_arm.get_proprioception()
+        obs_dict.update({f"right_{key}": value for key, value in right_obs.items()})
+        return obs_dict
+
+    @check_if_not_connected
     def get_observation(self) -> RobotObservation:
         obs_dict: RobotObservation = {}
         left_obs = self.left_arm.get_observation()
@@ -157,11 +167,17 @@ class BiPiperFollower(Robot):
         return {**prefixed_sent_action_left, **prefixed_sent_action_right}
 
     @check_if_not_connected
-    def go_home(self, settle_s: float = 6.0, period_s: float = 1 / 30) -> None:
-        run_piper_homes_parallel(
-            lambda: self.left_arm.go_home(settle_s=settle_s, period_s=period_s),
-            lambda: self.right_arm.go_home(settle_s=settle_s, period_s=period_s),
-        )
+    def go_home(self, settle_s: float = 6.0, period_s: float = 1 / 30) -> bool:
+        results: list[bool] = [False, False]
+
+        def home_left() -> None:
+            results[0] = self.left_arm.go_home(settle_s=settle_s, period_s=period_s)
+
+        def home_right() -> None:
+            results[1] = self.right_arm.go_home(settle_s=settle_s, period_s=period_s)
+
+        run_piper_homes_parallel(home_left, home_right)
+        return all(results)
 
     @check_if_not_connected
     def disconnect(self):

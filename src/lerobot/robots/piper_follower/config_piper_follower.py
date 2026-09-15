@@ -37,7 +37,7 @@ class PiperFollowerConfigBase:
     # Motion mode for follower arm
     speed_ratio: int = 100
     high_follow: bool = True
-    # Space-home only: MOVE_J speed percent, high-follow off. Teleop stays at speed_ratio=100.
+    # Space-home only: MOVE_J speed percent, high-follow off. Teleop/eval stay at speed_ratio=100.
     home_speed_ratio: int = 30
 
     # Arm enable behavior

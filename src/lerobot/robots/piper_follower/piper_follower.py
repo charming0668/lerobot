@@ -132,8 +132,7 @@ class PiperFollower(Robot):
         set_piper_role(self.arm, PIPER_ROLE_FOLLOWER)
         self._send_motion_mode()
 
-    @check_if_not_connected
-    def get_observation(self) -> RobotObservation:
+    def _read_proprioception(self) -> RobotObservation:
         joint_msg = self.arm.GetArmJointMsgs()
         joint_state = getattr(joint_msg, "joint_state", None)
 
@@ -145,9 +144,34 @@ class PiperFollower(Robot):
         gripper_msg = self.arm.GetArmGripperMsgs()
         gripper_state = getattr(gripper_msg, "gripper_state", None)
         obs["gripper.pos"] = abs(milli_to_unit(getattr(gripper_state, "grippers_angle", 0)))
+        return obs
 
+    @check_if_not_connected
+    def get_proprioception(self) -> RobotObservation:
+        """Joint and gripper state only; no camera frames."""
+        return self._read_proprioception()
+
+    def _read_camera_frame(self, cam):
+        """Prefer a non-blocking latest frame so the 30 Hz action loop is not stalled."""
+        read_latest = getattr(cam, "read_latest", None)
+        if callable(read_latest):
+            try:
+                return read_latest(max_age_ms=500)
+            except (TimeoutError, RuntimeError):
+                pass
+        async_read = getattr(cam, "async_read", None)
+        if async_read is None:
+            return cam.read()
+        try:
+            return async_read(timeout_ms=20)
+        except TypeError:
+            return async_read()
+
+    @check_if_not_connected
+    def get_observation(self) -> RobotObservation:
+        obs = self._read_proprioception()
         for cam_key, cam in self.cameras.items():
-            obs[cam_key] = cam.async_read()
+            obs[cam_key] = self._read_camera_frame(cam)
         return obs
 
     @check_if_not_connected
@@ -185,14 +209,22 @@ class PiperFollower(Robot):
         go_zero_joints(self.arm)
 
     @check_if_not_connected
-    def go_home(self, settle_s: float = 6.0, period_s: float = 1 / 30) -> None:
+    def go_home(self, settle_s: float = 6.0, period_s: float = 1 / 30) -> bool:
         """Hold joint zeros on this follower CAN until settled. Gripper is left unchanged.
 
         Homing uses MOVE_J at ``home_speed_ratio`` (default 30) without high-follow.
-        Teleop ``send_action`` stays at ``speed_ratio`` + high-follow; do not restore
+        Teleop/eval ``send_action`` stays at ``speed_ratio`` + high-follow; do not restore
         that mode here or the arm will snap the last 2° at full high-follow.
         """
-        wait_piper_joints_near_zero(
+        if self.config.enable_on_connect:
+            wait_enable_piper(self.arm, self.config.enable_timeout_s)
+        logger.info(
+            "%s homing at MOVE_J speed=%s (high-follow off) for %.1fs.",
+            self,
+            self.config.home_speed_ratio,
+            settle_s,
+        )
+        settled = wait_piper_joints_near_zero(
             self.arm,
             timeout_s=settle_s,
             period_s=period_s,
@@ -200,6 +232,7 @@ class PiperFollower(Robot):
             stop_on_near_zero=False,
         )
         self._hold_zero_joints()
+        return settled
 
     @check_if_not_connected
     def disconnect(self) -> None:

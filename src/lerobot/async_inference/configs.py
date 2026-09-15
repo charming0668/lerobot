@@ -174,6 +174,41 @@ class RobotClientConfig:
         metadata={"help": "RTC config. Enable with --rtc.enabled=true to send leftover over the wire."},
     )
 
+    # Observation key remap sent to PolicyServer. Not inferred from --rtc.
+    # Example: '{"observation.images.right_front": "observation.images.base_0_rgb"}'
+    rename_map: dict[str, str] = field(
+        default_factory=dict,
+        metadata={"help": "Map robot observation keys to checkpoint keys; forwarded as RemotePolicyConfig.rename_map."},
+    )
+
+    # Safety gate: home first; Enter toggles run/pause; Space homes; q/Esc exits.
+    confirm_chunk: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If true: go home and wait. Enter starts continuous policy (send observations). "
+                "Enter again pauses and holds the current pose (no home, no EmergencyStop). "
+                "Space homes then waits for Enter. q/Esc exits the client."
+            )
+        },
+    )
+
+    # Record executed ticks between two Enter presses (run → pause). Requires confirm_chunk.
+    record_trajectory: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If true with confirm_chunk: record commanded and measured joints from the first "
+                "Enter (start) to the next Enter (pause). Space/q before the second Enter discards. "
+                "Writes CSV+PNG under trajectory_dir."
+            )
+        },
+    )
+    trajectory_dir: str = field(
+        default="outputs/eval_traj",
+        metadata={"help": "Directory for Enter-Enter trajectory CSV and plots."},
+    )
+
     # Debug configuration
     debug_visualize_queue_size: bool = field(
         default=False, metadata={"help": "Visualize the action queue size"}
@@ -232,4 +267,8 @@ class RobotClientConfig:
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
             "aggregate_fn_name": self.aggregate_fn_name,
             "rtc": asdict(self.rtc),
+            "rename_map": self.rename_map,
+            "confirm_chunk": self.confirm_chunk,
+            "record_trajectory": self.record_trajectory,
+            "trajectory_dir": self.trajectory_dir,
         }
