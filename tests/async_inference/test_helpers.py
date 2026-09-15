@@ -168,6 +168,26 @@ def test_timed_data_deserialization_data_getters():
     assert to_out.get_observation().keys() == obs_dict.keys()
     torch.testing.assert_close(to_out.get_observation()[OBS_STATE], obs_dict[OBS_STATE])
 
+    leftover = torch.randn(5, 6)
+    to_rtc = TimedObservation(
+        timestamp=ts,
+        observation=obs_dict,
+        timestep=7,
+        inference_delay=4,
+        prev_chunk_left_over=leftover,
+        execution_horizon=10,
+    )
+    to_rtc_out: TimedObservation = pickle.loads(pickle.dumps(to_rtc))  # nosec B301
+    assert to_rtc_out.inference_delay == 4
+    assert to_rtc_out.execution_horizon == 10
+    torch.testing.assert_close(to_rtc_out.prev_chunk_left_over, leftover)
+
+    ta_rtc = TimedAction(
+        timestamp=ts, action=original_action, timestep=13, original_action=torch.ones(6)
+    )
+    ta_rtc_out: TimedAction = pickle.loads(pickle.dumps(ta_rtc))  # nosec B301
+    torch.testing.assert_close(ta_rtc_out.get_original_action(), torch.ones(6))
+
 
 # ---------------------------------------------------------------------
 # observations_similar()
@@ -330,6 +350,53 @@ def test_prepare_raw_observation():
     # Check that images are tensors
     assert isinstance(laptop_img, torch.Tensor)
     assert isinstance(phone_img, torch.Tensor)
+
+
+def test_prepare_raw_observation_renames_before_policy_lookup():
+    """Robot camera keys must be renamed before indexing policy image features."""
+    robot_obs = {
+        "shoulder": 1.0,
+        "elbow": 2.0,
+        "wrist": 3.0,
+        "gripper": 0.5,
+        "left_wrist": np.random.randint(0, 256, size=(480, 640, 3), dtype=np.uint8),
+        "right_front": np.random.randint(0, 256, size=(480, 640, 3), dtype=np.uint8),
+    }
+    lerobot_features = {
+        OBS_STATE: {
+            "dtype": "float32",
+            "shape": [4],
+            "names": ["shoulder", "elbow", "wrist", "gripper"],
+        },
+        f"{OBS_IMAGES}.left_wrist": {
+            "dtype": "image",
+            "shape": [480, 640, 3],
+            "names": ["height", "width", "channels"],
+        },
+        f"{OBS_IMAGES}.right_front": {
+            "dtype": "image",
+            "shape": [480, 640, 3],
+            "names": ["height", "width", "channels"],
+        },
+    }
+    policy_image_features = {
+        f"{OBS_IMAGES}.left_wrist_0_rgb": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 224, 224)),
+        f"{OBS_IMAGES}.base_0_rgb": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 160, 160)),
+    }
+    rename_map = {
+        f"{OBS_IMAGES}.left_wrist": f"{OBS_IMAGES}.left_wrist_0_rgb",
+        f"{OBS_IMAGES}.right_front": f"{OBS_IMAGES}.base_0_rgb",
+    }
+
+    prepared = prepare_raw_observation(
+        robot_obs, lerobot_features, policy_image_features, rename_map=rename_map
+    )
+
+    assert f"{OBS_IMAGES}.left_wrist_0_rgb" in prepared
+    assert f"{OBS_IMAGES}.base_0_rgb" in prepared
+    assert f"{OBS_IMAGES}.left_wrist" not in prepared
+    assert prepared[f"{OBS_IMAGES}.left_wrist_0_rgb"].shape == (3, 224, 224)
+    assert prepared[f"{OBS_IMAGES}.base_0_rgb"].shape == (3, 160, 160)
 
 
 def test_raw_observation_to_observation_basic():

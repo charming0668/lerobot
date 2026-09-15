@@ -30,10 +30,23 @@ python src/lerobot/async_inference/robot_client.py \
     --chunk_size_threshold=0.5 \
     --aggregate_fn_name=weighted_average \
     --debug_visualize_queue_size=True
+
+# Remote RTC (leftover over the wire). Requires the same patched server.
+python src/lerobot/async_inference/robot_client.py \
+    --robot.type=so100_follower \
+    --server_address=127.0.0.1:8080 \
+    --policy_type=pi05 \
+    --pretrained_name_or_path=user/model \
+    --policy_device=cuda \
+    --actions_per_chunk=50 \
+    --rtc.enabled=true \
+    --rtc.mode=trained \
+    --rtc.execution_horizon=20
 ```
 """
 
 import logging
+import math
 import pickle  # nosec
 import threading
 import time
@@ -61,6 +74,8 @@ except ImportError as e:
 else:
     from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401
 
+from lerobot.policies.rtc.action_queue import ActionQueue
+from lerobot.policies.rtc.latency_tracker import LatencyTracker
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
@@ -119,6 +134,7 @@ class RobotClient:
             lerobot_features,
             config.actions_per_chunk,
             config.policy_device,
+            rtc_config=config.rtc if config.rtc.enabled else None,
         )
         self.channel = grpc.insecure_channel(
             self.server_address, grpc_channel_options(initial_backoff=f"{config.environment_dt:.4f}s")
@@ -140,10 +156,23 @@ class RobotClient:
         self.action_queue_size = []
         self.start_barrier = threading.Barrier(2)  # 2 threads: action receiver, control loop
 
+        self.rtc_queue: ActionQueue | None = ActionQueue(config.rtc) if config.rtc.enabled else None
+        self.latency_tracker = LatencyTracker() if config.rtc.enabled else None
+        self._rtc_lock = threading.Lock()
+        self._rtc_inflight = False
+        self._rtc_index_before = 0
+        self._rtc_request_start = 0.0
+
         # FPS measurement
         self.fps_tracker = FPSTracker(target_fps=self.config.fps)
 
         self.logger.info("Robot connected and ready")
+        if config.rtc.enabled:
+            self.logger.info(
+                "Remote RTC enabled | mode=%s | execution_horizon=%s",
+                config.rtc.mode,
+                config.rtc.execution_horizon,
+            )
 
         # Use an event for thread-safe coordination
         self.must_go = threading.Event()
@@ -152,6 +181,10 @@ class RobotClient:
     @property
     def running(self):
         return not self.shutdown_event.is_set()
+
+    @property
+    def rtc_enabled(self) -> bool:
+        return self.config.rtc.enabled and self.rtc_queue is not None
 
     def start(self):
         """Start the robot client and connect to the policy server"""
@@ -228,6 +261,9 @@ class RobotClient:
             return False
 
     def _inspect_action_queue(self):
+        if self.rtc_enabled:
+            queue_size = self.rtc_queue.qsize()
+            return queue_size, list(range(queue_size))
         with self.action_queue_lock:
             queue_size = self.action_queue.qsize()
             timestamps = sorted([action.get_timestep() for action in self.action_queue.queue])
@@ -279,6 +315,33 @@ class RobotClient:
         with self.action_queue_lock:
             self.action_queue = future_action_queue
 
+    def _merge_rtc_actions(self, timed_actions: list[TimedAction]) -> None:
+        """Replace the RTC queue with the incoming chunk, skipping steps already executed."""
+        original = torch.stack([ta.get_original_action().detach().cpu() for ta in timed_actions])
+        processed = torch.stack([ta.get_action().detach().cpu() for ta in timed_actions])
+
+        with self._rtc_lock:
+            index_before = self._rtc_index_before
+            request_start = self._rtc_request_start
+            self._rtc_inflight = False
+
+        elapsed = time.perf_counter() - request_start
+        measured_delay = math.ceil(elapsed / self.config.environment_dt)
+        consumed = max(0, self.rtc_queue.get_action_index() - index_before)
+        # First chunk (nothing consumed yet) must not skip the prefix — that caused a startup jerk.
+        merge_delay = 0 if consumed == 0 else measured_delay
+
+        self.rtc_queue.merge(original, processed, merge_delay, index_before)
+        if self.latency_tracker is not None:
+            self.latency_tracker.add(elapsed)
+        self.logger.debug(
+            "RTC merge | delay=%d (consumed=%d, measured=%d) | queue=%d",
+            merge_delay,
+            consumed,
+            measured_delay,
+            self.rtc_queue.qsize(),
+        )
+
     def receive_actions(self, verbose: bool = False):
         """Receive actions from the policy server"""
         # Wait at barrier for synchronized start
@@ -290,6 +353,9 @@ class RobotClient:
                 # Use StreamActions to get a stream of actions from the server
                 actions_chunk = self.stub.GetActions(services_pb2.Empty())
                 if len(actions_chunk.data) == 0:
+                    if self.rtc_enabled:
+                        with self._rtc_lock:
+                            self._rtc_inflight = False
                     continue  # received `Empty` from server, wait for next call
 
                 receive_time = time.time()
@@ -344,7 +410,10 @@ class RobotClient:
 
                 # Update action queue
                 start_time = time.perf_counter()
-                self._aggregate_action_queues(timed_actions, self.config.aggregate_fn)
+                if self.rtc_enabled:
+                    self._merge_rtc_actions(timed_actions)
+                else:
+                    self._aggregate_action_queues(timed_actions, self.config.aggregate_fn)
                 queue_update_time = time.perf_counter() - start_time
 
                 self.must_go.set()  # after receiving actions, next empty queue triggers must-go processing!
@@ -373,6 +442,8 @@ class RobotClient:
 
     def actions_available(self):
         """Check if there are actions available in the queue"""
+        if self.rtc_enabled:
+            return not self.rtc_queue.empty()
         with self.action_queue_lock:
             return not self.action_queue.empty()
 
@@ -385,36 +456,51 @@ class RobotClient:
 
         # Lock only for queue operations
         get_start = time.perf_counter()
-        with self.action_queue_lock:
-            self.action_queue_size.append(self.action_queue.qsize())
-            # Get action from queue
-            timed_action = self.action_queue.get_nowait()
-        get_end = time.perf_counter() - get_start
+        if self.rtc_enabled:
+            action_tensor = self.rtc_queue.get()
+            self.action_queue_size.append(self.rtc_queue.qsize())
+            get_end = time.perf_counter() - get_start
+            if action_tensor is None:
+                return {}
+            timed_timestep = None
+        else:
+            with self.action_queue_lock:
+                self.action_queue_size.append(self.action_queue.qsize())
+                # Get action from queue
+                timed_action = self.action_queue.get_nowait()
+            get_end = time.perf_counter() - get_start
+            action_tensor = timed_action.get_action()
+            timed_timestep = timed_action.get_timestep()
 
-        _performed_action = self.robot.send_action(
-            self._action_tensor_to_action_dict(timed_action.get_action())
-        )
+        _performed_action = self.robot.send_action(self._action_tensor_to_action_dict(action_tensor))
         with self.latest_action_lock:
-            self.latest_action = timed_action.get_timestep()
+            if timed_timestep is None:
+                self.latest_action += 1
+            else:
+                self.latest_action = timed_timestep
 
         if verbose:
-            with self.action_queue_lock:
-                current_queue_size = self.action_queue.qsize()
-
+            if self.rtc_enabled:
+                current_queue_size = self.rtc_queue.qsize()
+            else:
+                with self.action_queue_lock:
+                    current_queue_size = self.action_queue.qsize()
             self.logger.debug(
-                f"Ts={timed_action.get_timestamp()} | "
-                f"Action #{timed_action.get_timestep()} performed | "
-                f"Queue size: {current_queue_size}"
-            )
-
-            self.logger.debug(
-                f"Popping action from queue to perform took {get_end:.6f}s | Queue size: {current_queue_size}"
+                f"Action #{self.latest_action} performed | Queue size: {current_queue_size} | "
+                f"Pop took {get_end:.6f}s"
             )
 
         return _performed_action
 
     def _ready_to_send_observation(self):
         """Flags when the client is ready to send an observation"""
+        if self.rtc_enabled:
+            with self._rtc_lock:
+                if self._rtc_inflight:
+                    return False
+            if self.action_chunk_size <= 0:
+                return True
+            return self.rtc_queue.qsize() / self.action_chunk_size <= self._chunk_size_threshold
         with self.action_queue_lock:
             return self.action_queue.qsize() / self.action_chunk_size <= self._chunk_size_threshold
 
@@ -429,20 +515,48 @@ class RobotClient:
             with self.latest_action_lock:
                 latest_action = self.latest_action
 
+            leftover = None
+            inference_delay = 0
+            execution_horizon = None
+            if self.rtc_enabled:
+                leftover = self.rtc_queue.get_left_over()
+                if leftover is not None and leftover.numel() == 0:
+                    leftover = None
+                max_latency = 0.0 if self.latency_tracker is None else (self.latency_tracker.max() or 0.0)
+                if leftover is None:
+                    inference_delay = 0
+                else:
+                    inference_delay = math.ceil(max_latency / self.config.environment_dt)
+                execution_horizon = self.config.rtc.execution_horizon
+                with self._rtc_lock:
+                    self._rtc_index_before = self.rtc_queue.get_action_index()
+                    self._rtc_request_start = time.perf_counter()
+                    self._rtc_inflight = True
+
             observation = TimedObservation(
                 timestamp=time.time(),  # need time.time() to compare timestamps across client and server
                 observation=raw_observation,
                 timestep=max(latest_action, 0),
+                inference_delay=inference_delay,
+                prev_chunk_left_over=leftover,
+                execution_horizon=execution_horizon,
             )
 
             obs_capture_time = time.perf_counter() - start_time
 
             # If there are no actions left in the queue, the observation must go through processing!
-            with self.action_queue_lock:
-                observation.must_go = self.must_go.is_set() and self.action_queue.empty()
-                current_queue_size = self.action_queue.qsize()
+            if self.rtc_enabled:
+                observation.must_go = self.must_go.is_set() and self.rtc_queue.empty()
+                current_queue_size = self.rtc_queue.qsize()
+            else:
+                with self.action_queue_lock:
+                    observation.must_go = self.must_go.is_set() and self.action_queue.empty()
+                    current_queue_size = self.action_queue.qsize()
 
-            _ = self.send_observation(observation)
+            sent = self.send_observation(observation)
+            if not sent and self.rtc_enabled:
+                with self._rtc_lock:
+                    self._rtc_inflight = False
 
             self.logger.debug(f"QUEUE SIZE: {current_queue_size} (Must go: {observation.must_go})")
             if observation.must_go:
@@ -466,6 +580,9 @@ class RobotClient:
             return raw_observation
 
         except Exception as e:
+            if self.rtc_enabled:
+                with self._rtc_lock:
+                    self._rtc_inflight = False
             self.logger.error(f"Error in observation sender: {e}")
 
     def control_loop(self, task: str, verbose: bool = False) -> tuple[Observation, Action]:

@@ -24,12 +24,14 @@ python -m lerobot.async_inference.policy_server \
 ```
 """
 
+import json
 import logging
 import pickle  # nosec
 import threading
 import time
 from concurrent import futures
 from dataclasses import asdict
+from pathlib import Path
 from pprint import pformat
 from queue import Empty, Queue
 from typing import Any
@@ -38,6 +40,7 @@ import draccus
 import grpc
 import torch
 
+from lerobot.configs import FeatureType
 from lerobot.lerobot_types import PolicyAction
 from lerobot.policies import get_policy_class, make_pre_post_processors
 from lerobot.processor import PolicyProcessorPipeline
@@ -79,7 +82,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         self.last_processed_obs = None
 
-        # Attributes will be set by SendPolicyInstructions
+        # Attributes will be set by preload() or SendPolicyInstructions
         self.device = None
         self.policy_type = None
         self.lerobot_features = None
@@ -87,6 +90,9 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.policy = None
         self.preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None
         self.postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None
+        self._preloaded_path: str | None = None
+        self._model_ready = False
+        self.rename_map: dict[str, str] = {}
 
     @property
     def running(self):
@@ -105,7 +111,127 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         with self._predicted_timesteps_lock:
             self._predicted_timesteps = set()
 
+    def _infer_policy_type(self, pretrained_path: str) -> str:
+        config_file = Path(pretrained_path) / "config.json"
+        if config_file.is_file():
+            data = json.loads(config_file.read_text(encoding="utf-8"))
+            policy_type = data.get("type")
+            if policy_type:
+                return str(policy_type)
+        raise ValueError("Cannot infer policy type. Pass --policy_type or use a checkpoint with config.json.")
+
+    def _load_policy(
+        self,
+        pretrained_path: str,
+        policy_type: str,
+        device: str,
+        actions_per_chunk: int,
+    ) -> None:
+        if policy_type not in SUPPORTED_POLICIES:
+            raise ValueError(
+                f"Policy type {policy_type} not supported. Supported policies: {SUPPORTED_POLICIES}"
+            )
+        self.logger.info("Loading policy %s from %s onto %s", policy_type, pretrained_path, device)
+        policy_class = get_policy_class(policy_type)
+        self.policy = policy_class.from_pretrained(pretrained_path)
+        self.policy.to(device)
+        self.device = device
+        self.policy_type = policy_type
+        self.actions_per_chunk = actions_per_chunk
+        self._preloaded_path = str(Path(pretrained_path).resolve())
+
+    def _apply_runtime_overrides(
+        self,
+        *,
+        pretrained_path: str,
+        device: str,
+        rename_map: dict[str, str] | None = None,
+        rtc_config: Any | None = None,
+    ) -> None:
+        device_override = {"device": device}
+        self.rename_map = dict(rename_map or {})
+        self.logger.info("Observation rename_map: %s", self.rename_map)
+        self.preprocessor, self.postprocessor = make_pre_post_processors(
+            self.policy.config,
+            pretrained_path=pretrained_path,
+            preprocessor_overrides={
+                "device_processor": device_override,
+                "rename_observations_processor": {"rename_map": self.rename_map},
+            },
+            postprocessor_overrides={"device_processor": device_override},
+        )
+
+        if rtc_config is not None and getattr(rtc_config, "enabled", False):
+            supports_rtc = getattr(self.policy, "supports_rtc", None)
+            if not callable(supports_rtc) or not supports_rtc():
+                raise ValueError(
+                    f"Policy type {self.policy_type} does not support RTC. "
+                    "Use a flow-matching policy (pi0, pi05, smolvla) or disable --rtc.enabled."
+                )
+            self.policy.config.rtc_config = rtc_config
+            if hasattr(self.policy, "init_rtc_processor"):
+                self.policy.init_rtc_processor()
+            self.logger.info("RTC enabled on policy: %s", rtc_config)
+
+    def _make_dummy_observation(self) -> dict[str, Any]:
+        if self.policy is None:
+            raise RuntimeError("Policy must be loaded before warmup")
+        dummy: dict[str, Any] = {}
+        for key, feat in self.policy.config.input_features.items():
+            if feat.type == FeatureType.VISUAL:
+                dummy[key] = torch.zeros(1, *feat.shape, dtype=torch.float32)
+            elif feat.type == FeatureType.STATE:
+                dummy[key] = torch.zeros(1, *feat.shape, dtype=torch.float32)
+        dummy["task"] = [self.config.warmup_task]
+        return dummy
+
+    def warmup(self) -> None:
+        if self.policy is None or self.preprocessor is None or self.postprocessor is None:
+            raise RuntimeError("warmup() requires a loaded policy and processors")
+        self.logger.info("Running dummy inference to warm CUDA kernels and verify the forward pass")
+        dummy = self._make_dummy_observation()
+        processed = self.preprocessor(dummy)
+        with torch.no_grad():
+            chunk = self._get_action_chunk(processed)
+        try:
+            _ = self.postprocessor(chunk)
+        except Exception:
+            _ = self.postprocessor(chunk[:, 0, :])
+        self.logger.info("WARMUP_OK action chunk shape=%s", tuple(chunk.shape))
+
+    def mark_ready(self) -> None:
+        self._model_ready = True
+        ready_path = Path(self.config.ready_file)
+        ready_path.parent.mkdir(parents=True, exist_ok=True)
+        ready_path.write_text(
+            f"ready\nhost={self.config.host}\nport={self.config.port}\npath={self._preloaded_path}\n",
+            encoding="utf-8",
+        )
+        self.logger.info("POLICY_READY accepting observations on %s:%s", self.config.host, self.config.port)
+        self.logger.info("Ready marker: %s", ready_path.resolve())
+
+    def preload(self) -> None:
+        if not self.config.pretrained_path:
+            return
+        policy_type = self.config.policy_type or self._infer_policy_type(self.config.pretrained_path)
+        self._load_policy(
+            self.config.pretrained_path,
+            policy_type,
+            self.config.device,
+            self.config.actions_per_chunk,
+        )
+        self._apply_runtime_overrides(
+            pretrained_path=self.config.pretrained_path,
+            device=self.config.device,
+        )
+        if self.config.warmup:
+            self.warmup()
+        self.mark_ready()
+
     def Ready(self, request, context):  # noqa: N802
+        if self._preloaded_path is not None and not self._model_ready:
+            context.abort(grpc.StatusCode.UNAVAILABLE, "Policy is still loading or warmup has not finished.")
+
         client_id = context.peer()
         self.logger.info(f"Client {client_id} connected and ready")
         self._reset_server()
@@ -146,26 +272,35 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.lerobot_features = policy_specs.lerobot_features
         self.actions_per_chunk = policy_specs.actions_per_chunk
 
-        policy_class = get_policy_class(self.policy_type)
-
-        start = time.perf_counter()
-        self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
-        self.policy.to(self.device)
-
-        # Load preprocessor and postprocessor, overriding device to match requested device
-        device_override = {"device": self.device}
-        self.preprocessor, self.postprocessor = make_pre_post_processors(
-            self.policy.config,
-            pretrained_path=policy_specs.pretrained_name_or_path,
-            preprocessor_overrides={
-                "device_processor": device_override,
-                "rename_observations_processor": {"rename_map": policy_specs.rename_map},
-            },
-            postprocessor_overrides={"device_processor": device_override},
+        same_checkpoint = (
+            self.policy is not None
+            and self._preloaded_path is not None
+            and Path(policy_specs.pretrained_name_or_path).resolve() == Path(self._preloaded_path).resolve()
         )
 
-        end = time.perf_counter()
+        start = time.perf_counter()
+        if same_checkpoint:
+            self.logger.info(
+                "Policy already preloaded from %s; skipping weight reload",
+                self._preloaded_path,
+            )
+        else:
+            self._load_policy(
+                policy_specs.pretrained_name_or_path,
+                policy_specs.policy_type,
+                policy_specs.device,
+                policy_specs.actions_per_chunk,
+            )
 
+        self._apply_runtime_overrides(
+            pretrained_path=policy_specs.pretrained_name_or_path,
+            device=policy_specs.device,
+            rename_map=policy_specs.rename_map,
+            rtc_config=getattr(policy_specs, "rtc_config", None),
+        )
+        self._model_ready = True
+
+        end = time.perf_counter()
         self.logger.info(f"Time taken to put policy on {self.device}: {end - start:.4f} seconds")
 
         return services_pb2.Empty()
@@ -219,6 +354,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         # Generate action based on the most recent observation and its timestep
         try:
+            if self.policy is None:
+                context.abort(grpc.StatusCode.FAILED_PRECONDITION, "Policy is not loaded.")
+            if self._preloaded_path is not None and not self._model_ready:
+                context.abort(grpc.StatusCode.FAILED_PRECONDITION, "Policy warmup has not finished.")
             getactions_starts = time.perf_counter()
             obs = self.observation_queue.get(timeout=self.config.obs_queue_timeout)
             self.logger.info(
@@ -261,9 +400,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             return services_pb2.Empty()
 
         except Exception as e:
-            self.logger.error(f"Error in StreamActions: {e}")
-
-            return services_pb2.Empty()
+            self.logger.exception("Error in GetActions")
+            context.abort(grpc.StatusCode.INTERNAL, str(e))
 
     def _obs_sanity_checks(self, obs: TimedObservation, previous_obs: TimedObservation) -> bool:
         """Check if the observation is valid to be processed by the policy"""
@@ -309,19 +447,86 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         return False
 
-    def _time_action_chunk(self, t_0: float, action_chunk: list[torch.Tensor], i_0: int) -> list[TimedAction]:
+    def _rtc_enabled(self) -> bool:
+        rtc_config = getattr(getattr(self.policy, "config", None), "rtc_config", None)
+        supports_rtc = getattr(self.policy, "supports_rtc", None)
+        return bool(
+            rtc_config is not None
+            and getattr(rtc_config, "enabled", False)
+            and callable(supports_rtc)
+            and supports_rtc()
+        )
+
+    def _prepare_rtc_kwargs(self, observation_t: TimedObservation) -> dict[str, Any]:
+        """Build predict_action_chunk kwargs from the client-provided leftover."""
+        if not self._rtc_enabled():
+            return {}
+
+        inference_delay = int(getattr(observation_t, "inference_delay", 0) or 0)
+        leftover = getattr(observation_t, "prev_chunk_left_over", None)
+        if leftover is not None and leftover.numel() == 0:
+            leftover = None
+        if leftover is not None:
+            leftover = leftover.to(device=self.device)
+
+        training_max_delay = int(getattr(self.policy.config, "rtc_training_max_delay", 0) or 0)
+        rtc_mode = getattr(self.policy.config.rtc_config, "mode", "guided")
+        if rtc_mode == "trained" and training_max_delay > 0 and inference_delay > training_max_delay:
+            self.logger.warning(
+                "Clamping inference_delay=%d to rtc_training_max_delay=%d",
+                inference_delay,
+                training_max_delay,
+            )
+            inference_delay = training_max_delay
+
+        execution_horizon = getattr(observation_t, "execution_horizon", None)
+        if execution_horizon is None:
+            execution_horizon = self.policy.config.rtc_config.execution_horizon
+
+        leftover_shape = None if leftover is None else tuple(leftover.shape)
+        self.logger.info(
+            "RTC inference | delay=%d | leftover=%s | horizon=%s | mode=%s",
+            inference_delay,
+            leftover_shape,
+            execution_horizon,
+            rtc_mode,
+        )
+        return {
+            "inference_delay": inference_delay,
+            "prev_chunk_left_over": leftover,
+            "execution_horizon": execution_horizon,
+        }
+
+    def _time_action_chunk(
+        self,
+        t_0: float,
+        action_chunk: list[torch.Tensor],
+        i_0: int,
+        original_chunk: list[torch.Tensor] | None = None,
+    ) -> list[TimedAction]:
         """Turn a chunk of actions into a list of TimedAction instances,
         with the first action corresponding to t_0 and the rest corresponding to
         t_0 + i*environment_dt for i in range(len(action_chunk))
         """
-        return [
-            TimedAction(timestamp=t_0 + i * self.config.environment_dt, timestep=i_0 + i, action=action)
-            for i, action in enumerate(action_chunk)
-        ]
+        timed = []
+        for i, action in enumerate(action_chunk):
+            original = None if original_chunk is None else original_chunk[i]
+            timed.append(
+                TimedAction(
+                    timestamp=t_0 + i * self.config.environment_dt,
+                    timestep=i_0 + i,
+                    action=action,
+                    original_action=original,
+                )
+            )
+        return timed
 
-    def _get_action_chunk(self, observation: dict[str, torch.Tensor]) -> torch.Tensor:
+    def _get_action_chunk(
+        self, observation: dict[str, torch.Tensor], *, timed_obs: TimedObservation | None = None
+    ) -> torch.Tensor:
         """Get an action chunk from the policy. The chunk contains only"""
-        chunk = self.policy.predict_action_chunk(observation)
+        predict_kwargs = {} if timed_obs is None else self._prepare_rtc_kwargs(timed_obs)
+        chunk = self.policy.predict_action_chunk(observation, **predict_kwargs)
         if chunk.ndim != 3:
             chunk = chunk.unsqueeze(0)  # adding batch dimension, now shape is (B, chunk_size, action_dim)
 
@@ -343,6 +548,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             observation_t.get_observation(),
             self.lerobot_features,
             self.policy_image_features,
+            rename_map=self.rename_map,
         )
         prepare_time = time.perf_counter() - start_prepare
 
@@ -354,7 +560,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         """3. Get action chunk"""
         start_inference = time.perf_counter()
-        action_tensor = self._get_action_chunk(observation)
+        action_tensor = self._get_action_chunk(observation, timed_obs=observation_t)
         inference_time = time.perf_counter() - start_inference
         self.logger.info(
             f"Preprocessing and inference took {inference_time:.4f}s, action shape: {action_tensor.shape}"
@@ -367,23 +573,29 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         start_postprocess = time.perf_counter()
         _, chunk_size, _ = action_tensor.shape
 
-        # Process each action in the chunk
-        processed_actions = []
-        for i in range(chunk_size):
-            # Extract action at timestep i: (B, action_dim)
-            single_action = action_tensor[:, i, :]
-            processed_action = self.postprocessor(single_action)
-            processed_actions.append(processed_action)
+        # Keep model-space actions for the client's next RTC leftover.
+        original_actions = action_tensor.squeeze(0).detach().cpu()
 
-        # Stack back to (B, chunk_size, action_dim), then remove batch dim
-        action_tensor = torch.stack(processed_actions, dim=1).squeeze(0)
+        try:
+            action_tensor = self.postprocessor(action_tensor).squeeze(0)
+        except Exception:
+            processed_actions = []
+            for i in range(chunk_size):
+                single_action = action_tensor[:, i, :]
+                processed_action = self.postprocessor(single_action)
+                processed_actions.append(processed_action)
+            action_tensor = torch.stack(processed_actions, dim=1).squeeze(0)
         self.logger.debug(f"Postprocessed action shape: {action_tensor.shape}")
 
         action_tensor = action_tensor.detach().cpu()
+        original_list = list(original_actions) if self._rtc_enabled() else None
 
         """5. Convert to TimedAction list"""
         action_chunk = self._time_action_chunk(
-            observation_t.get_timestamp(), list(action_tensor), observation_t.get_timestep()
+            observation_t.get_timestamp(),
+            list(action_tensor),
+            observation_t.get_timestep(),
+            original_chunk=original_list,
         )
         postprocess_stops = time.perf_counter()
         postprocessing_time = postprocess_stops - start_postprocess
@@ -421,8 +633,10 @@ def serve(cfg: PolicyServerConfig):
 
     # Create the server instance first
     policy_server = PolicyServer(cfg)
+    if cfg.pretrained_path:
+        policy_server.preload()
 
-    # Setup and start gRPC server
+    # Setup and start gRPC server only after a successful preload/warmup (if requested)
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
     services_pb2_grpc.add_AsyncInferenceServicer_to_server(policy_server, server)
     server.add_insecure_port(f"{cfg.host}:{cfg.port}")
@@ -430,9 +644,13 @@ def serve(cfg: PolicyServerConfig):
     policy_server.logger.info(f"PolicyServer started on {cfg.host}:{cfg.port}")
     server.start()
 
-    server.wait_for_termination()
-
-    policy_server.logger.info("Server terminated")
+    try:
+        server.wait_for_termination()
+    finally:
+        ready_path = Path(cfg.ready_file)
+        if ready_path.exists():
+            ready_path.unlink()
+        policy_server.logger.info("Server terminated")
 
 
 if __name__ == "__main__":
