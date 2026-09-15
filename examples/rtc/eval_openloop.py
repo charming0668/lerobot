@@ -76,10 +76,14 @@ class OpenLoopEvalConfig(HubMixin):
 
 def _postprocess_chunk(postprocessor, action_chunk: torch.Tensor) -> torch.Tensor:
     """Unnormalize (B, H, A) model-space actions to robot space."""
-    processed = []
-    for i in range(action_chunk.shape[1]):
-        processed.append(postprocessor(action_chunk[:, i, :]))
-    return torch.stack(processed, dim=1)
+    try:
+        res = postprocessor(action_chunk)
+        return res[ACTION] if isinstance(res, dict) else res
+    except Exception:
+        processed = []
+        for i in range(action_chunk.shape[1]):
+            processed.append(postprocessor(action_chunk[:, i, :]))
+        return torch.stack(processed, dim=1)
 
 
 def _select_frame_indices(dataset: LeRobotDataset, chunk_size: int, num_samples: int, seed: int) -> list[int]:
@@ -107,7 +111,12 @@ def _select_frame_indices(dataset: LeRobotDataset, chunk_size: int, num_samples:
     return indices
 
 
-def _dim_labels(policy_cfg) -> list[str]:
+def _dim_labels(policy_cfg, ds_meta=None) -> list[str]:
+    if ds_meta is not None and ACTION in ds_meta.features:
+        feat = ds_meta.features[ACTION]
+        names = feat.get('names') if isinstance(feat, dict) else getattr(feat, 'names', None)
+        if names:
+            return list(names)
     names = getattr(policy_cfg, "action_feature_names", None)
     if names:
         return list(names)
@@ -245,7 +254,7 @@ def main(cfg: OpenLoopEvalConfig):
     mae_vs_h = np.nanmean(stacked, axis=(0, 2))
     overall = float(np.nanmean(stacked))
 
-    names = _dim_labels(policy.config)[: stacked.shape[-1]]
+    names = _dim_labels(policy.config, ds_meta)[: stacked.shape[-1]]
     metrics = {
         "overall_mae": overall,
         "mae_per_dim": {name: float(v) for name, v in zip(names, mae_per_dim, strict=True)},
