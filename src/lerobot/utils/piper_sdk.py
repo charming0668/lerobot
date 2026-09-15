@@ -162,21 +162,27 @@ def wait_piper_joints_near_zero(
     period_s: float = 0.05,
     tolerance_deg: float = PIPER_HOME_JOINT_TOLERANCE_DEG,
     on_tick: Callable[[], None] | None = None,
+    stop_on_near_zero: bool = True,
 ) -> bool:
     """Poll until joints are near zero, optionally commanding on each tick.
 
     Returns True if the arm reached the tolerance before ``timeout_s``.
+    ``stop_on_near_zero=False`` keeps commanding until ``timeout_s`` (needed so
+    a follower does not restore high-follow the instant it first crosses 2°).
     """
     deadline = time.monotonic() + max(0.0, timeout_s)
     interval_s = max(0.01, period_s)
+    reached = False
     while True:
         if on_tick is not None:
             on_tick()
         if piper_joints_near_zero(arm, tolerance_deg=tolerance_deg):
-            return True
+            reached = True
+            if stop_on_near_zero:
+                return True
         remaining_s = deadline - time.monotonic()
         if remaining_s <= 0:
-            return False
+            return reached
         time.sleep(min(interval_s, remaining_s))
 
 

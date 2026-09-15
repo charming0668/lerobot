@@ -43,6 +43,7 @@ class BiPiperFollower(Robot):
         "startup_sleep_s",
         "speed_ratio",
         "high_follow",
+        "home_speed_ratio",
         "enable_on_connect",
         "enable_timeout_s",
         "sync_gripper",

@@ -426,3 +426,219 @@ def test_wait_enter_session_discards_on_left(monkeypatch):
     dataset.clear_episode_buffer.assert_called_once()
     dataset.save_episode.assert_not_called()
 
+
+def test_wait_enter_countdown_ignores_space(monkeypatch):
+    from lerobot.scripts import lerobot_record as rec
+    from lerobot.utils.cycle_timer import CycleTimer
+
+    events = {
+        "exit_early": False,
+        "rerecord_episode": False,
+        "stop_recording": False,
+        "start_episode": False,
+        "go_home": False,
+    }
+    idle_calls = {"n": 0}
+    countdown_breaks: list[tuple[str, ...]] = []
+
+    def fake_record_loop(*, dataset, control_time_s=None, extra_break_events=(), **kwargs):
+        if dataset is not None:
+            events["exit_early"] = True
+            return
+        idle_calls["n"] += 1
+        if idle_calls["n"] == 1:
+            events["start_episode"] = True
+        elif control_time_s:
+            countdown_breaks.append(tuple(extra_break_events))
+            events["go_home"] = True
+        else:
+            events["stop_recording"] = True
+
+    monkeypatch.setattr(rec, "record_loop", fake_record_loop)
+    monkeypatch.setattr(rec, "log_say", lambda *args, **kwargs: None)
+
+    robot = MagicMock()
+    robot.go_home = MagicMock()
+    teleop = MagicMock()
+    teleop.go_home = MagicMock()
+    dataset = MagicMock()
+    dataset.num_episodes = 0
+    dataset.has_pending_frames.return_value = True
+
+    cfg = RecordConfig(
+        robot=MockRobotConfig(),
+        teleop=MockTeleopConfig(),
+        dataset=DatasetRecordConfig(
+            repo_id=DUMMY_REPO_ID,
+            single_task="Dummy task",
+            num_episodes=1,
+            countdown_s=0.01,
+            wait_enter=True,
+            push_to_hub=False,
+        ),
+        play_sounds=False,
+    )
+
+    rec._record_wait_enter_session(
+        cfg=cfg,
+        robot=robot,
+        teleop=teleop,
+        dataset=dataset,
+        events=events,
+        timer=CycleTimer(30),
+        teleop_action_processor=MagicMock(),
+        robot_action_processor=MagicMock(),
+        robot_observation_processor=MagicMock(),
+        display_compressed_images=False,
+    )
+
+    assert countdown_breaks
+    assert all("go_home" not in breaks for breaks in countdown_breaks)
+    dataset.save_episode.assert_called_once()
+    robot.go_home.assert_not_called()
+    teleop.go_home.assert_not_called()
+
+
+def test_wait_enter_esc_during_record_discards(monkeypatch):
+    from lerobot.scripts import lerobot_record as rec
+    from lerobot.utils.cycle_timer import CycleTimer
+
+    events = {
+        "exit_early": False,
+        "rerecord_episode": False,
+        "stop_recording": False,
+        "start_episode": False,
+        "go_home": False,
+    }
+    idle_calls = {"n": 0}
+
+    def fake_record_loop(*, dataset, control_time_s=None, extra_break_events=(), **kwargs):
+        if dataset is not None:
+            events["stop_recording"] = True
+            events["exit_early"] = True
+            return
+        idle_calls["n"] += 1
+        if idle_calls["n"] == 1:
+            events["start_episode"] = True
+        elif control_time_s:
+            return
+        else:
+            events["stop_recording"] = True
+
+    monkeypatch.setattr(rec, "record_loop", fake_record_loop)
+    monkeypatch.setattr(rec, "log_say", lambda *args, **kwargs: None)
+
+    dataset = MagicMock()
+    dataset.num_episodes = 0
+    dataset.has_pending_frames.return_value = True
+
+    cfg = RecordConfig(
+        robot=MockRobotConfig(),
+        teleop=MockTeleopConfig(),
+        dataset=DatasetRecordConfig(
+            repo_id=DUMMY_REPO_ID,
+            single_task="Dummy task",
+            num_episodes=1,
+            countdown_s=0.01,
+            wait_enter=True,
+            push_to_hub=False,
+        ),
+        play_sounds=False,
+    )
+
+    rec._record_wait_enter_session(
+        cfg=cfg,
+        robot=MagicMock(),
+        teleop=MagicMock(),
+        dataset=dataset,
+        events=events,
+        timer=CycleTimer(30),
+        teleop_action_processor=MagicMock(),
+        robot_action_processor=MagicMock(),
+        robot_observation_processor=MagicMock(),
+        display_compressed_images=False,
+    )
+
+    dataset.clear_episode_buffer.assert_called_once()
+    dataset.save_episode.assert_not_called()
+
+
+def test_wait_enter_enter_during_home_starts_next_episode(monkeypatch):
+    """Enter while Space-home is running should start the next episode, not wait again."""
+    from lerobot.scripts import lerobot_record as rec
+    from lerobot.utils.cycle_timer import CycleTimer
+
+    events = {
+        "exit_early": False,
+        "rerecord_episode": False,
+        "stop_recording": False,
+        "start_episode": False,
+        "go_home": False,
+    }
+    idle_kinds: list[str] = []
+    record_count = {"n": 0}
+
+    def fake_record_loop(*, dataset, control_time_s=None, extra_break_events=(), **kwargs):
+        if dataset is not None:
+            record_count["n"] += 1
+            dataset.num_episodes = record_count["n"]
+            events["exit_early"] = True
+            return
+        if control_time_s:
+            idle_kinds.append("countdown")
+            return
+        idle_kinds.append("wait")
+        n_wait = idle_kinds.count("wait")
+        if n_wait == 1:
+            events["start_episode"] = True
+        elif n_wait == 2:
+            events["go_home"] = True
+        else:
+            events["stop_recording"] = True
+
+    def go_home_sets_enter(*args, **kwargs):
+        events["start_episode"] = True
+
+    monkeypatch.setattr(rec, "record_loop", fake_record_loop)
+    monkeypatch.setattr(rec, "log_say", lambda *args, **kwargs: None)
+
+    robot = MagicMock()
+    robot.go_home = go_home_sets_enter
+    teleop = MagicMock()
+    teleop.go_home = MagicMock()
+    dataset = MagicMock()
+    dataset.num_episodes = 0
+    dataset.has_pending_frames.return_value = True
+
+    cfg = RecordConfig(
+        robot=MockRobotConfig(),
+        teleop=MockTeleopConfig(),
+        dataset=DatasetRecordConfig(
+            repo_id=DUMMY_REPO_ID,
+            single_task="Dummy task",
+            num_episodes=2,
+            countdown_s=0.01,
+            home_settle_s=0.01,
+            wait_enter=True,
+            push_to_hub=False,
+        ),
+        play_sounds=False,
+    )
+
+    rec._record_wait_enter_session(
+        cfg=cfg,
+        robot=robot,
+        teleop=teleop,
+        dataset=dataset,
+        events=events,
+        timer=CycleTimer(30),
+        teleop_action_processor=MagicMock(),
+        robot_action_processor=MagicMock(),
+        robot_observation_processor=MagicMock(),
+        display_compressed_images=False,
+    )
+
+    assert record_count["n"] == 2
+    assert dataset.save_episode.call_count == 2
+    assert idle_kinds[:4] == ["wait", "countdown", "wait", "countdown"]
+

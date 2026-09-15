@@ -121,10 +121,16 @@ class PiperFollower(Robot):
     def calibrate(self) -> None:
         pass
 
+    def _send_motion_mode(self, *, speed_ratio: int | None = None, high_follow: bool | None = None) -> None:
+        # PiPER drops CAN command / high-follow unless 0x151 is refreshed each tick.
+        speed = self.config.speed_ratio if speed_ratio is None else speed_ratio
+        follow = self.config.high_follow if high_follow is None else high_follow
+        mit_mode = 0xAD if follow else 0x00
+        self.arm.MotionCtrl_2(0x01, 0x01, speed, mit_mode)
+
     def configure(self) -> None:
         set_piper_role(self.arm, PIPER_ROLE_FOLLOWER)
-        mit_mode = 0xAD if self.config.high_follow else 0x00
-        self.arm.MotionCtrl_2(0x01, 0x01, self.config.speed_ratio, mit_mode)
+        self._send_motion_mode()
 
     @check_if_not_connected
     def get_observation(self) -> RobotObservation:
@@ -153,6 +159,7 @@ class PiperFollower(Robot):
         if has_all_joints:
             joint_targets = [action[key] for key in joint_keys]
             joint_commands = [unit_to_milli(value) for value in joint_targets]
+            self._send_motion_mode()
             self.arm.JointCtrl(*joint_commands)
             sent_action.update(
                 {key: milli_to_unit(raw) for key, raw in zip(joint_keys, joint_commands, strict=True)}
@@ -172,16 +179,27 @@ class PiperFollower(Robot):
 
         return sent_action
 
+    def _hold_zero_joints(self) -> None:
+        # Official piper_ctrl_go_zero.py: ModeCtrl(0x01, 0x01, 30, 0x00) then JointCtrl zeros.
+        self._send_motion_mode(speed_ratio=self.config.home_speed_ratio, high_follow=False)
+        go_zero_joints(self.arm)
+
     @check_if_not_connected
     def go_home(self, settle_s: float = 6.0, period_s: float = 1 / 30) -> None:
-        """Hold joint zeros on this follower CAN until settled. Gripper is left unchanged."""
+        """Hold joint zeros on this follower CAN until settled. Gripper is left unchanged.
+
+        Homing uses MOVE_J at ``home_speed_ratio`` (default 30) without high-follow.
+        Teleop ``send_action`` stays at ``speed_ratio`` + high-follow; do not restore
+        that mode here or the arm will snap the last 2° at full high-follow.
+        """
         wait_piper_joints_near_zero(
             self.arm,
             timeout_s=settle_s,
             period_s=period_s,
-            on_tick=lambda: go_zero_joints(self.arm),
+            on_tick=self._hold_zero_joints,
+            stop_on_near_zero=False,
         )
-        go_zero_joints(self.arm)
+        self._hold_zero_joints()
 
     @check_if_not_connected
     def disconnect(self) -> None:

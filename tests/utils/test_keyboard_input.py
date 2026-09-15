@@ -245,3 +245,21 @@ def test_create_key_listener_none_without_tty(monkeypatch):
     monkeypatch.setattr(ki, "pynput_can_capture", lambda: False)
     _set_tty(monkeypatch, is_tty=False)
     assert create_key_listener(lambda name: None) is None
+
+
+def test_silence_tty_echo_none_when_not_tty(monkeypatch):
+    _set_tty(monkeypatch, is_tty=False)
+    assert ki._silence_tty_echo() is None
+
+
+def test_listener_with_cleanup_runs_on_stop_once():
+    calls: list[str] = []
+
+    class Inner:
+        def stop(self):
+            calls.append("inner")
+
+    wrapped = ki._ListenerWithCleanup(Inner(), lambda: calls.append("restore"))
+    wrapped.stop()
+    wrapped.stop()
+    assert calls == ["inner", "restore", "inner"]

@@ -484,7 +484,10 @@ def _record_wait_enter_session(
                 break
             if events["go_home"]:
                 maybe_home()
-                continue
+                if events["stop_recording"]:
+                    break
+                if not events["start_episode"]:
+                    continue
             events["start_episode"] = False
         skip_wait_enter = False
 
@@ -498,7 +501,7 @@ def _record_wait_enter_session(
             events["go_home"] = False
             idle(
                 control_time_s=countdown_s if countdown_s > 0 else 0,
-                extra_break_events=("start_episode", "rerecord_episode", "stop_recording", "go_home"),
+                extra_break_events=("start_episode", "rerecord_episode", "stop_recording"),
             )
             events["go_home"] = False
             events["exit_early"] = False
@@ -530,11 +533,12 @@ def _record_wait_enter_session(
         events["start_episode"] = False
         events["exit_early"] = False
 
-        if events["rerecord_episode"]:
-            log_say("Discarded episode", cfg.play_sounds)
+        if events["rerecord_episode"] or events["stop_recording"]:
+            if events["rerecord_episode"] or dataset.has_pending_frames():
+                log_say("Discarded episode", cfg.play_sounds)
+                dataset.clear_episode_buffer()
+                timer.log_episode_summary("discarded episode")
             events["rerecord_episode"] = False
-            dataset.clear_episode_buffer()
-            timer.log_episode_summary("discarded episode")
             timer.restart()
         elif dataset.has_pending_frames():
             dataset.save_episode()
@@ -562,6 +566,9 @@ def _record_wait_enter_session(
             break
         if events["go_home"]:
             maybe_home()
+            if events["start_episode"]:
+                events["start_episode"] = False
+                skip_wait_enter = True
         elif events["start_episode"]:
             events["start_episode"] = False
             skip_wait_enter = True

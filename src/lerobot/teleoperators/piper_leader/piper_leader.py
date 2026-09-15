@@ -35,7 +35,6 @@ from lerobot.utils.piper_sdk import (
     set_piper_role,
     unit_to_milli,
     wait_enable_piper,
-    wait_piper_joints_near_zero,
 )
 
 from ..teleoperator import Teleoperator
@@ -260,17 +259,45 @@ class PiperLeader(Teleoperator):
     def get_action(self) -> RobotAction:
         return self._read_raw_action()
 
+    def _seed_manual_action_at_home(self) -> None:
+        """Resume teach after firmware home without reading 0x2A5.
+
+        ``set_manual_control(True)`` switches to 0xFC and waits up to
+        ``enable_timeout_s`` (3s) for ``GetArmJointMsgs``. After homing that
+        feedback is stale or absent; a late seed then jerks the follower off
+        zero when teleop resumes. Seed zeros and ignore cached 0x155 until a
+        new control-frame timestamp arrives.
+        """
+        gripper_pos = 0.0
+        if self._manual_action is not None:
+            gripper_pos = float(self._manual_action.get("gripper.pos", 0.0))
+        self._manual_action = {f"{joint_name}.pos": 0.0 for joint_name in PIPER_JOINT_NAMES}
+        self._manual_action["gripper.pos"] = gripper_pos
+        try:
+            self._last_control_joint_timestamp = self.arm.GetArmJointCtrl().time_stamp
+        except Exception:
+            self._last_control_joint_timestamp = 0.0
+        try:
+            self._last_control_gripper_timestamp = (
+                self.arm.GetArmGripperCtrl().time_stamp if self.config.sync_gripper else 0.0
+            )
+        except Exception:
+            self._last_control_gripper_timestamp = 0.0
+        self._manual_control_enabled = True
+
     @check_if_not_connected
     def go_home(self, settle_s: float = 6.0) -> None:
         """Home this leader on its own CAN via ``ReqMasterArmMoveToHome(1)``.
 
         Does not use mode=2: the follower lives on a different CAN socket.
+
+        Teach-mode leaders do not publish ``GetArmJointMsgs`` (0x2A5); wait a
+        fixed ``settle_s`` instead of polling that feedback.
         """
         req_master_arm_home(self.arm, 1)
-        wait_piper_joints_near_zero(self.arm, timeout_s=settle_s)
+        time.sleep(max(0.0, settle_s))
         req_master_arm_home(self.arm, 0)
-        self._manual_control_enabled = None
-        self.set_manual_control(True)
+        self._seed_manual_action_at_home()
 
     @check_if_not_connected
     def send_feedback(self, feedback: dict[str, Any]) -> None:

@@ -332,6 +332,60 @@ else:
     _PYNPUT_KEY_NAMES = {}
 
 
+def _silence_tty_echo() -> Callable[[], None] | None:
+    """Disable TTY echo so arrow-key CSI sequences are not printed.
+
+    ``pynput`` captures keys at the display-server level and does not consume them
+    from the recording terminal. With echo left on, Left/Right show up as
+    ``^[[D`` / ``^[[C`` glued to the next log line. The terminal backend already
+    turns echo off in :meth:`TerminalKeyListener.start`; this covers the pynput path.
+
+    Returns a restore callback, or ``None`` when stdin is not a TTY / not POSIX.
+    """
+    if not _TERMIOS_AVAILABLE or not sys.stdin.isatty():
+        return None
+    fd = sys.stdin.fileno()
+    old_attrs = termios.tcgetattr(fd)
+    new_attrs = termios.tcgetattr(fd)
+    new_attrs[3] &= ~termios.ECHO
+    termios.tcsetattr(fd, termios.TCSADRAIN, new_attrs)
+
+    restored = False
+
+    def restore() -> None:
+        nonlocal restored
+        if restored:
+            return
+        restored = True
+        with contextlib.suppress(Exception):
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+        with contextlib.suppress(Exception):
+            atexit.unregister(restore)
+
+    atexit.register(restore)
+    return restore
+
+
+class _ListenerWithCleanup:
+    """Delegate ``.stop()`` to ``listener`` and then run ``on_stop`` once."""
+
+    def __init__(self, listener, on_stop: Callable[[], None] | None):
+        self._listener = listener
+        self._on_stop = on_stop
+
+    def stop(self) -> None:
+        try:
+            self._listener.stop()
+        finally:
+            on_stop = self._on_stop
+            self._on_stop = None
+            if on_stop is not None:
+                on_stop()
+
+    def __getattr__(self, name):
+        return getattr(self._listener, name)
+
+
 def _resolve_pynput_key(key) -> str | None:
     """Resolve a pynput key event to the canonical name TerminalKeyListener also emits.
 
@@ -377,7 +431,7 @@ def create_key_listener(dispatch: Callable[[str], None], *, controls_help: str =
         listener.start()
         if pynput_listener_is_trusted(listener):
             logger.info("Keyboard listener started%s.", suffix)
-            return listener
+            return _ListenerWithCleanup(listener, _silence_tty_echo())
         # macOS without Accessibility / Input-Monitoring permission: the listener never
         # fires. Stop it and fall through to the terminal backend.
         logger.warning(
