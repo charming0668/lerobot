@@ -2,6 +2,13 @@
 # 控臂客户端：在物理连接 Piper 双臂的工控机/PC 上运行，连入 PolicyServer 评测
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$ROOT"
+
+# 本脚本用裸 python，先激活本机 lerobot 环境；切到仓库根目录是为了解析下面的相对路径
+source /home/ming/miniforge3/etc/profile.d/conda.sh
+conda activate lerobot
+
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 
