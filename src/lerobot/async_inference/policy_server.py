@@ -193,7 +193,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         processed = self.preprocessor(dummy)
         with torch.no_grad():
             chunk = self._get_action_chunk(processed)
-        _ = self.postprocessor(chunk[:, 0, :])
+        try:
+            _ = self.postprocessor(chunk)
+        except Exception:
+            _ = self.postprocessor(chunk[:, 0, :])
         self.logger.info("WARMUP_OK action chunk shape=%s", tuple(chunk.shape))
 
     def mark_ready(self) -> None:
@@ -573,16 +576,15 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         # Keep model-space actions for the client's next RTC leftover.
         original_actions = action_tensor.squeeze(0).detach().cpu()
 
-        # Process each action in the chunk
-        processed_actions = []
-        for i in range(chunk_size):
-            # Extract action at timestep i: (B, action_dim)
-            single_action = action_tensor[:, i, :]
-            processed_action = self.postprocessor(single_action)
-            processed_actions.append(processed_action)
-
-        # Stack back to (B, chunk_size, action_dim), then remove batch dim
-        action_tensor = torch.stack(processed_actions, dim=1).squeeze(0)
+        try:
+            action_tensor = self.postprocessor(action_tensor).squeeze(0)
+        except Exception:
+            processed_actions = []
+            for i in range(chunk_size):
+                single_action = action_tensor[:, i, :]
+                processed_action = self.postprocessor(single_action)
+                processed_actions.append(processed_action)
+            action_tensor = torch.stack(processed_actions, dim=1).squeeze(0)
         self.logger.debug(f"Postprocessed action shape: {action_tensor.shape}")
 
         action_tensor = action_tensor.detach().cpu()

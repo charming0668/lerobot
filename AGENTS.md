@@ -27,6 +27,16 @@ DEVICE=cuda make test-end-to-end                      # All E2E tests
 pre-commit run --all-files                           # Lint + format (ruff, typos, bandit, etc.)
 ```
 
+## Running & Evaluation Scripts (`scripts/`)
+
+项目训练与评测执行脚本遵循标准分类存放规范，禁止散落在项目根目录：
+
+- **`scripts/train/`** — 训练启动脚本与多卡集群配置：
+  - `scripts/train/train_groot_4gpu.sh`：GR00T N1.7 模型 4 卡 DDP 并行训练启动脚本（针对 RTX 4090 非 NVLink 拓扑优化了 NCCL 通信，支持日志与 Checkpoint 规范归档）。
+- **`scripts/eval/`** — 评测与异步推理客户端/服务端启动脚本：
+  - `scripts/eval/start_groot_policy_server.sh`：基于 gRPC 的异步策略服务端（PolicyServer），负责预加载 GR00T Checkpoint（如 4000 步权重）、执行 Warmup 并监听 `0.0.0.0:8080`。
+  - `scripts/eval/start_groot_robot_client.sh`：机械臂控制端评测客户端（RobotClient），连入 PolicyServer，负责采集双腕+正前视角图像并闭环下发时域动作块。
+
 ## Architecture (`src/lerobot/`)
 
 - **`scripts/`** — CLI entry points (`lerobot-train`, `lerobot-eval`, `lerobot-record`, etc.), mapped in `pyproject.toml [project.scripts]`.
