@@ -151,11 +151,27 @@ class PiperFollower(Robot):
         """Joint and gripper state only; no camera frames."""
         return self._read_proprioception()
 
+    def _read_camera_frame(self, cam):
+        """Prefer a non-blocking latest frame so the 30 Hz action loop is not stalled."""
+        read_latest = getattr(cam, "read_latest", None)
+        if callable(read_latest):
+            try:
+                return read_latest(max_age_ms=500)
+            except (TimeoutError, RuntimeError):
+                pass
+        async_read = getattr(cam, "async_read", None)
+        if async_read is None:
+            return cam.read()
+        try:
+            return async_read(timeout_ms=20)
+        except TypeError:
+            return async_read()
+
     @check_if_not_connected
     def get_observation(self) -> RobotObservation:
         obs = self._read_proprioception()
         for cam_key, cam in self.cameras.items():
-            obs[cam_key] = cam.async_read()
+            obs[cam_key] = self._read_camera_frame(cam)
         return obs
 
     @check_if_not_connected

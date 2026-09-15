@@ -118,6 +118,10 @@ from .trajectory_recorder import TrajectoryRecorder
 class RobotClient:
     prefix = "robot_client"
     logger = get_logger(prefix)
+    # Spread a chunk-seam jump so each tick stays near normal joint speed (~1.2° L2).
+    _SEAM_BLEND_L2 = 2.0
+    _SEAM_BLEND_MAX_STEP_L2 = 1.5
+    _SEAM_BLEND_MAX_STEPS = 24
 
     def __init__(self, config: RobotClientConfig):
         """Initialize RobotClient with unified configuration.
@@ -201,6 +205,9 @@ class RobotClient:
             enabled=bool(config.record_trajectory and config.confirm_chunk),
         )
         self._traj_obs_warned = False
+        self._obs_kick = threading.Event()
+        self._obs_args: tuple[str, bool] = ("", False)
+        self._obs_thread: threading.Thread | None = None
 
     @property
     def running(self):
@@ -255,6 +262,10 @@ class RobotClient:
         self.shutdown_event.set()
         self._enter_go.set()
         self._home_go.set()
+        self._obs_kick.set()
+        if self._obs_thread is not None:
+            self._obs_thread.join(timeout=1.0)
+            self._obs_thread = None
 
         if self._confirm_listener is not None:
             with contextlib.suppress(Exception):
@@ -375,12 +386,14 @@ class RobotClient:
                     self.logger.info("Dropping action chunk from an aborted request")
                     return
                 self._rx_gen = self._obs_gen
-        # First chunk (nothing consumed yet) must not skip the prefix — that caused a startup jerk.
-        merge_delay = 0 if consumed == 0 else measured_delay
+        # Skip the steps actually executed while waiting, not wall-clock RTT.
+        merge_delay = consumed
         if self.latency_tracker is not None:
             self.latency_tracker.add(elapsed)
 
         self.rtc_queue.merge(original, processed, merge_delay, index_before)
+        with self.rtc_queue.lock:
+            self._blend_chunk_seam()
         self.logger.debug(
             "RTC merge | delay=%d (consumed=%d, measured=%d) | queue=%d",
             merge_delay,
@@ -583,7 +596,10 @@ class RobotClient:
                 if leftover is None:
                     inference_delay = 0
                 else:
-                    inference_delay = math.ceil(max_latency / self.config.environment_dt)
+                    leftover_steps = leftover.shape[0]
+                    inference_delay = min(
+                        leftover_steps, math.ceil(max_latency / self.config.environment_dt)
+                    )
                 execution_horizon = self.config.rtc.execution_horizon
                 with self._rtc_lock:
                     if self.config.confirm_chunk:
@@ -643,6 +659,81 @@ class RobotClient:
                 with self._rtc_lock:
                     self._rtc_inflight = False
             self.logger.error(f"Error in observation sender: {e}")
+
+    def _ensure_obs_thread(self) -> None:
+        if self._obs_thread is not None and self._obs_thread.is_alive():
+            return
+        self._obs_thread = threading.Thread(target=self._observation_worker, name="obs_sender", daemon=True)
+        self._obs_thread.start()
+
+    def _observation_worker(self) -> None:
+        while True:
+            signaled = self._obs_kick.wait(timeout=0.1)
+            if not signaled:
+                if not self.running:
+                    break
+                continue
+            self._obs_kick.clear()
+            task, verbose = self._obs_args
+            try:
+                self.control_loop_observation(task, verbose)
+            except Exception:
+                self.logger.exception("Observation worker failed")
+                if self.rtc_enabled:
+                    with self._rtc_lock:
+                        self._rtc_inflight = False
+            if not self.running and not self._obs_kick.is_set():
+                break
+
+    def _request_observation(self, task: str, verbose: bool) -> None:
+        """Capture and send an observation off the 30 Hz action loop."""
+        if self.rtc_enabled:
+            with self._rtc_lock:
+                if self._rtc_inflight:
+                    return
+                self._rtc_inflight = True
+        elif self._obs_kick.is_set():
+            return
+        self._obs_args = (task, verbose)
+        self._ensure_obs_thread()
+        self._obs_kick.set()
+
+    def _held_action_tensor(self, dim: int, dtype: torch.dtype) -> torch.Tensor | None:
+        if not self._held_action:
+            return None
+        keys = list(self.robot.action_features)
+        values = [float(self._held_action.get(key, 0.0)) for key in keys]
+        held = torch.tensor(values, dtype=dtype)
+        if held.numel() < dim:
+            held = torch.cat([held, torch.zeros(dim - held.numel(), dtype=dtype)])
+        return held[:dim]
+
+    @classmethod
+    def _seam_blend_steps(cls, l2: float, available: int) -> int:
+        """How many ticks to ease into a new chunk. 0 means do not blend."""
+        if l2 < cls._SEAM_BLEND_L2 or available <= 1:
+            return 0
+        n = int(math.ceil(l2 / cls._SEAM_BLEND_MAX_STEP_L2))
+        return max(2, min(n, cls._SEAM_BLEND_MAX_STEPS, available))
+
+    def _blend_chunk_seam(self) -> None:
+        """Ease from the current pose onto the new chunk; do not snap to its first command."""
+        if self.rtc_queue is None or self.rtc_queue.queue is None or len(self.rtc_queue.queue) == 0:
+            return
+        processed = self.rtc_queue.queue
+        held = self._held_action_tensor(processed.shape[-1], processed.dtype)
+        if held is None:
+            return
+        l2 = float(torch.linalg.vector_norm(processed[0] - held).item())
+        n = self._seam_blend_steps(l2, len(processed))
+        if n <= 0:
+            return
+        t = (torch.arange(n, dtype=processed.dtype) + 1) / n
+        alphas = 0.5 * (1.0 - torch.cos(torch.pi * t))
+        blended = processed.clone()
+        blended[:n] = (1.0 - alphas[:, None]) * held + alphas[:, None] * processed[:n]
+        self.rtc_queue.queue = blended
+        self.logger.info("Seam blend %s steps (joint L2=%.1f, cosine onto chunk)", n, l2)
 
     def _on_confirm_key(self, name: str) -> None:
         key = name.lower()
@@ -782,7 +873,7 @@ class RobotClient:
                 if performed:
                     self._held_action = performed
             if self._ready_to_send_observation():
-                self.control_loop_observation(task, verbose)
+                self._request_observation(task, verbose)
             return
 
         self._hold_last_action()
@@ -807,7 +898,7 @@ class RobotClient:
 
                 """Control loop: (2) Streaming observations to the remote policy server"""
                 if self._ready_to_send_observation():
-                    _captured_observation = self.control_loop_observation(task, verbose)
+                    _captured_observation = self._request_observation(task, verbose)
 
             self.logger.debug(f"Control loop (ms): {(time.perf_counter() - control_loop_start) * 1000:.2f}")
             # Dynamically adjust sleep time to maintain the desired control frequency
