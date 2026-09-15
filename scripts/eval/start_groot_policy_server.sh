@@ -12,7 +12,7 @@
  FPS="${FPS:-30}"
  DEVICE="${DEVICE:-cuda}"
  ACTIONS_PER_CHUNK="${ACTIONS_PER_CHUNK:-16}"
- WARMUP_TASK="${WARMUP_TASK:-Pick up the red cube and put it in the pen holder}"
+ WARMUP_TASK="${WARMUP_TASK:-Pick up the cube and put it in the pen holder}"
  READY_FILE="${READY_FILE:-logs/policy_server_groot.ready}"
  LOG_FILE="${LOG_FILE:-logs/policy_server_groot.log}"
  

@@ -36,6 +36,8 @@ pre-commit run --all-files                           # Lint + format (ruff, typo
 - **`scripts/eval/`** — 评测与异步推理客户端/服务端启动脚本：
   - `scripts/eval/start_groot_policy_server.sh`：基于 gRPC 的异步策略服务端（PolicyServer），负责预加载 GR00T Checkpoint（如 4000 步权重）、执行 Warmup 并监听 `0.0.0.0:8080`。
   - `scripts/eval/start_groot_robot_client.sh`：机械臂控制端评测客户端（RobotClient），连入 PolicyServer，负责采集双腕+正前视角图像并闭环下发时域动作块。
+  - `scripts/eval/start_policy_server.sh`：pi05 RTC 策略服务端（PolicyServer），预加载 pi05 RTC Checkpoint（`030000`）并执行 Warmup，监听 `0.0.0.0:8080`。
+  - `scripts/eval/start_robot_client.sh`：pi05 RTC 控臂客户端（RobotClient），经 SSH 隧道连入 PolicyServer，启用 trained RTC（`execution_horizon=20`）闭环下发动作块。
   - `scripts/eval/run_groot_openloop_eval.sh`：离线开环（Open-Loop）数据集拟合评测脚本，对比模型预测动作块与真值轨迹（Ground Truth），产出逐维度 MAE 及拟合曲线。
 
 ## Architecture (`src/lerobot/`)
