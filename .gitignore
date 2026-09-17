@@ -178,3 +178,6 @@ logs/
 *.xml
 *.part
 dataset/
+checkpoint
+checpoints/
+eval_logs/

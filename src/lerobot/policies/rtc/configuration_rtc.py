@@ -59,3 +59,12 @@ class RTCConfig:
             raise ValueError(f"max_guidance_weight must be positive, got {self.max_guidance_weight}")
         if self.debug_maxlen <= 0:
             raise ValueError(f"debug_maxlen must be positive, got {self.debug_maxlen}")
+
+        # Mutual exclusivity guard: execution_horizon only affects 'guided' mode.
+        # In 'trained' mode, prefix inpainting is handled natively by the model.
+        if self.mode == "trained" and self.execution_horizon is not None and self.execution_horizon != 10:
+            raise ValueError(
+                f"Config conflict: `execution_horizon` ({self.execution_horizon}) is only applicable "
+                "when `mode='guided'`. In `mode='trained'`, prefix conditioning is handled natively by "
+                "the model according to `rtc_training_max_delay`. Please remove `execution_horizon`."
+            )

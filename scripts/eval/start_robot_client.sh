@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# 控臂客户端：在本机运行，经 SSH 隧道（18080 -> GPU 服务器 8080）连入 PolicyServer 评测
+# 控臂客户端：在本机运行，经 SSH 隧道（8080 -> GPU 服务器 8080）连入 PolicyServer 评测
 set -euo pipefail
 
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 
 exec python -m lerobot.async_inference.robot_client \
-  --server_address="127.0.0.1:18080" \
+  --server_address="127.0.0.1:8080" \
   --policy_type=pi05 \
-  --pretrained_name_or_path="/data1/hmcai/lerobot/outputs/pi05_rtc/checkpoints/030000/pretrained_model" \
+  --pretrained_name_or_path="/data1/hmcai/lerobot/outputs/piper_pi05_merged_030000" \
   --policy_device=cuda \
   --client_device=cpu \
   --actions_per_chunk=50 \
@@ -17,7 +17,6 @@ exec python -m lerobot.async_inference.robot_client \
   --task="Pick up the cube and put it in the pen holder" \
   --rtc.enabled=true \
   --rtc.mode=trained \
-  --rtc.execution_horizon=20 \
   --robot.type=bi_piper_follower \
   --robot.id="my_bi_piper_follower" \
   --robot.left_arm_config.port="001E002D5246570620323934" \
