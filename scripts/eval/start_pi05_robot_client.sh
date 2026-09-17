@@ -21,4 +21,7 @@ exec python -m lerobot.async_inference.robot_client \
   --robot.id="my_bi_piper_follower" \
   --robot.left_arm_config.port="001E002D5246570620323934" \
   --robot.right_arm_config.port="003B00485246570620323934" \
-  --robot.cameras="{ base_0_rgb: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 30}, left_wrist_0_rgb: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}, right_wrist_0_rgb: {type: opencv, index_or_path: 1, width: 640, height: 480, fps: 30}}"
+  --robot.left_arm_config.cameras="{ wrist: {type: intelrealsense, serial_number_or_name: '352122272576', width: 640, height: 480, fps: 30, warmup_s: 2} }" \
+  --robot.right_arm_config.cameras="{ wrist: {type: intelrealsense, serial_number_or_name: '352122273050', width: 640, height: 480, fps: 30, warmup_s: 2}, front: {type: intelrealsense, serial_number_or_name: '050522071191', width: 640, height: 480, fps: 30, warmup_s: 2} }" \
+  --rename_map='{"observation.images.right_front": "observation.images.base_0_rgb", "observation.images.left_wrist": "observation.images.left_wrist_0_rgb", "observation.images.right_wrist": "observation.images.right_wrist_0_rgb"}' \
+  --confirm_chunk=true
